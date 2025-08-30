@@ -1,0 +1,2455 @@
+---
+engine: knitr
+bibliography: references.bib
+format:
+  pdf:
+    documentclass: scrartcl
+    toc: false
+    toc-depth: 3
+    number-sections: true
+    fig-width: 8
+    fig-height: 6
+    latex-engine: xelatex
+    header-includes: |
+      \usepackage{fontspec}
+      \newfontfamily\ipaFont{Charis SIL}
+      \newcommand{\ipa}[1]{{\ipaFont #1}}
+      \makeatletter
+      \renewcommand{\tableofcontents}{%
+        \section*{Table of Contents}%
+        \@starttoc{toc}%
+      }
+      \makeatother
+    keep-tex: true
+  html:
+    df-print: default
+    toc: true
+    toc-depth: 3
+    fig-width: 8
+    fig-height: 6
+    number-sections: true
+    embed-resources: true
+    lof: true
+    lot: true
+execute:
+  warning: false
+link-citations: true
+csl: "apa_7th.csl"
+number-sections: true
+---
+
+```{=tex}
+\begin{titlepage}
+    \centering
+
+    \includegraphics[width=0.2\textwidth]{logo.jpg}\par
+    \vspace{0.5cm}
+
+    {\Large Universität zu Köln \par}
+    {\large Faculty of Arts and Humanities, Department of Linguistics \par}
+    \vspace{1cm}
+    
+    {\Large\itshape Master's Thesis \par}
+    \vspace{1cm}
+
+    {\LARGE\bfseries Discovering Patterns in Regional Linguistic
+Variation: A Dimensionality Reduction Approach \par}
+    \vspace{0.7cm}
+    
+        \begin{center}
+        {\normalsize \textit{A Thesis Submitted in Partial Fulfillment of the Requirements for the Degree}}\\[0.25cm]
+        {\Large Master of Arts}\\[0.25cm]
+        {\normalsize \textit{in the}}\\[0.25cm]
+        {\Large Master Linguistik}
+    \end{center}
+    \vfill
+    
+    {\large Author: Gina Isabell Reinhard \par}
+    {\large Matriculation Number: 7341306\par}
+    \vspace{1cm}
+    {\large Supervisor: Dr. Ivan Kapitonov \par}
+    
+    \vspace{1cm}
+
+    {\large August 30, 2025 \par}
+
+\end{titlepage}
+```
+{{< pagebreak >}}
+
+\pagenumbering{roman}
+
+\tableofcontents
+
+{{< pagebreak >}}
+
+\listoffigures
+
+\listoftables
+
+```{r load-libraries, include=FALSE}
+
+library(factoextra) #for visualisation of MCA results
+library(FactoMineR) #package to conduct MCA
+library(ggrepel) #to avoid label overlaps in plots
+library(kableExtra)
+library(knitr)
+library(missMDA) #package to handle missing values, compatible with FactoMineR
+library(naniar) #to examine missing data
+library(sf) #for geographical maps
+library(tidyverse)
+
+#libraries for databases:
+library(DBI)
+library(RMariaDB)
+library(RPostgres)
+
+```
+
+```{r read-credentials, include=FALSE}
+
+password <- readRDS("password.rds")
+username <- readRDS("username.rds")
+host <- readRDS("host.rds")
+port <- readRDS("port.rds")
+dbname <- readRDS("dbname.rds")
+
+password2 <- readRDS("password2.rds")
+username2 <- readRDS("username2.rds")
+host2 <- readRDS("host2.rds")
+port2 <- readRDS("port2.rds")
+dbname2 <- readRDS("dbname2.rds")
+
+```
+
+```{r db-credentials, include=FALSE}
+
+#Usernames & passwords for databases (invisible):
+
+ conAnn <- DBI::dbConnect(
+   RMariaDB::MariaDB(),
+   host = host,
+   port = port,
+   username = username,
+   password = password,
+   dbname = dbname
+ )
+ 
+ conPalava <- DBI::dbConnect(
+   RPostgres::Postgres(),
+   dbname = dbname2,
+   host = host2,
+   port = port2,
+   user = username2,
+   password = password2
+ )
+```
+
+```{r extract-metadata, include=FALSE}
+
+#get all metadata from database (create dataframe "metaData"):
+ metaData <- DBI::dbGetQuery(
+   conPalava,
+   "SELECT * FROM survey_surveyresultquestionanswer"
+ ) |>
+   tidyr::pivot_wider(
+     id_cols = survey_result_id,
+     names_from = question_text,
+     values_from = answer_text,
+     values_fn = ~ paste(.x, sep = ",", collapse = ",")
+   ) |>
+   dplyr::left_join(
+     DBI::dbGetQuery(conPalava, "SELECT * FROM survey_surveyresult"),
+     by = c("survey_result_id" = "id")
+   ) |>
+   dplyr::select(dplyr::any_of(c(
+     "survey_result_id",
+     "Höchster Bildungsabschluss",
+     "Altersklasse",
+     "Geburtsjahr",
+     "user_lat", "user_lng",
+     "area_lat", "area_lng",
+     "area_name", "country_name",
+     "Geschlecht", "submitted_at"
+   ))) |>
+   dplyr::filter(!grepl(",", Geburtsjahr)) |>
+   dplyr::mutate(Geburtsjahr = as.integer(Geburtsjahr)) |> 
+   tidyr::drop_na() |>
+   dplyr::mutate(
+     Altersklasse = cut(
+       Geburtsjahr,
+       breaks = seq(min(Geburtsjahr), max(Geburtsjahr) + 10, by = 10),
+       labels = paste0(
+         seq(min(Geburtsjahr), max(Geburtsjahr), by = 10), "-",
+         seq(min(Geburtsjahr) + 10, max(Geburtsjahr) + 10, by = 10) - 1
+       )
+     )
+   ) |>
+   dplyr::mutate(Altersklasse = as.character(Altersklasse)) |> 
+   dplyr::select(-Geburtsjahr)
+
+```
+
+```{r extract-annotations, include=FALSE}
+
+#get all annotations from database:
+annotation <- DBI::dbGetQuery(conAnn, "SELECT * FROM annotations;")
+
+```
+
+```{r clean-data, include=FALSE}
+
+#some cleaning (e.g. conversion to data type character) to be able to handle data later
+
+metaData <- metaData |> 
+  mutate(survey_result_id = as.character(survey_result_id)) |> 
+  rename(education_level = `Höchster Bildungsabschluss`)
+
+annotation <- annotation |> 
+  mutate(survey_result_id = as.character(survey_result_id))
+
+```
+
+```{r function-variable-dfs, include=FALSE}
+
+#define function for creating annotation dfs for each task:
+create_variable_df <- function(data, task_id) {
+  data |> 
+    filter(task_id == {{task_id}})
+}
+
+```
+
+```{r prep-vowellength, include=FALSE}
+
+#Fahrrad:
+annotation_fahrrad <- create_variable_df(annotation, 145) 
+
+annotation_fahrrad <- annotation_fahrrad |> 
+    mutate(type = recode(type,
+                      "Transkription" = "transcription_fahrrad",
+                      "Transkription_Variante" = "transcription_v_fahrrad",
+                      "Annotation_VokallängeA1" = "fahr",
+                      "Annotation_VokallängeA2" = "vowellength_rad")) |> 
+  pivot_wider(names_from = type, 
+              values_from = value, 
+              values_fn = ~ first(.x[!is.na(.x)])) |>
+  #regroup annotations/categories (vowel length = "unklar" -> NA):
+  mutate(
+    fahr = case_when(
+      fahr == "unklar" ~ NA_character_,
+      TRUE ~ fahr
+    ),
+    vowellength_rad = case_when(
+      vowellength_rad == "unklar" ~ NA_character_,
+      TRUE ~ vowellength_rad
+    )
+  )
+
+#Oma & Opa:
+annotation_omaopa <- create_variable_df(annotation, 146) |> 
+  pivot_wider(names_from = type, 
+              values_from = value, 
+              values_fn = ~ first(.x[!is.na(.x)])) |>
+  rename(oma = Annotation_VokallängeOma) |> 
+  rename(opa = Annotation_VokallängeOpa)
+
+#Krümel
+annotation_kruemel <- create_variable_df(annotation, 152)
+annotation_kruemel <- annotation_kruemel |> 
+    mutate(type = recode(type,
+                      "Transkription" = "transcription_kruemel",
+                      "Annotation_Präp" = "preposition_kruemel",
+                      "Vokallänge" = "vowellength_kruemel",
+                      "Lexem_Krümel" = "lexeme_kruemel",
+                      "Anlaut" = "onset_kruemel")) |> 
+  pivot_wider(names_from = type, 
+              values_from = value, 
+              values_fn = ~ first(.x[!is.na(.x)]))
+
+#Kaffee
+annotation_kaffee <- create_variable_df(annotation, 281)
+annotation_kaffee <- annotation_kaffee |> 
+    mutate(type = recode(type,
+                      "Transkription" = "transcription_kaffee",
+                      "Kommentar" = "notes_kaffee")) |> 
+  pivot_wider(names_from = type, 
+              values_from = value, 
+              values_fn = ~ first(.x[!is.na(.x)]))
+
+```
+
+```{r prep-g-after-front-vowel, include=FALSE}
+
+#Weg:
+annotation_weg <- create_variable_df(annotation, 144)
+annotation_weg <- annotation_weg |> 
+    mutate(type = recode(type,
+                      "Transkription" = "transcription_weg",
+                      "Transkription_Variante" = "transcription_v1_weg",
+                      "Transkription_Variante2" = "transcription_v2_weg",
+                      "Annotation_Anlaut_Pfad" = "onset_Pfad",
+                      "Annotation_Auslaut_Weg" = "coda_Weg",
+                      "Kommentar" = "notes_weg",
+                      "Diminutiv" = "diminutive_weg")) |> 
+  pivot_wider(names_from = type, 
+              values_from = value, 
+              values_fn = ~ first(.x[!is.na(.x)]))
+
+#Berg:
+annotation_berg <- create_variable_df(annotation, 126) 
+annotation_berg <- annotation_berg |> 
+    mutate(type = recode(type,
+                      "Annotation_Dativ" = "dative_berg",
+                      "Annotation_aufDem" = "aufDem_berg",
+                      "Annotation_BergVariante" = "berg")) |> 
+  pivot_wider(names_from = type, 
+              values_from = value, 
+              values_fn = ~ first(.x[!is.na(.x)]))
+
+```
+
+```{r prep-g-after-velar-vowel, include=FALSE}
+
+#Zug:
+annotation_zug <- create_variable_df(annotation, 270)
+annotation_zug <- annotation_zug |> 
+    mutate(type = recode(type,
+                      "Transkription" = "transcription_zug",
+                      "Kommentar" = "notes_zug",
+                      "Vokallänge" = "vocallength_zug")) |> 
+  pivot_wider(names_from = type, 
+              values_from = value, 
+              values_fn = ~ first(.x[!is.na(.x)]))
+
+```
+
+```{r prep-diminutive-suffix, include=FALSE}
+
+#bisschen:
+annotation_bisschen <- create_variable_df(annotation, 68)
+annotation_bisschen <- annotation_bisschen |> 
+    mutate(type = recode(type,
+                      "Transkription" = "transcription_bisschen",
+                      "Annotation_Diminutiv" = "diminutive_bisschen",
+                      "Annotation_Diminutiv" = "diminutive2_bisschen",
+                      "Annotation_AuslautWenig" = "coda_wenig_bisschen")) |> 
+  pivot_wider(names_from = type, 
+              values_from = value, 
+              values_fn = ~ first(.x[!is.na(.x)]))
+
+#Pinnchen:
+annotation_pinnchen <- create_variable_df(annotation, 102)
+annotation_pinnchen <- annotation_pinnchen |> 
+    mutate(type = recode(type,
+                      "Transkription" = "transcription_pinnchen",
+                      "Transkription_Variante" = "transcription_v_pinnchen",
+                      "Kommentar" = "notes_pinnchen",
+                      "Diminutiv" = "pinn")) |> 
+  pivot_wider(names_from = type, 
+              values_from = value, 
+              values_fn = ~ first(.x[!is.na(.x)]))
+
+#Bömsken:
+annotation_bonbons <- create_variable_df(annotation, 112)
+annotation_bonbons <- annotation_bonbons |> 
+    mutate(type = recode(type,
+                      "Transkription" = "transcription_bonbons",
+                      "Transkription_Variante" = "transcription_v_bonbons",
+                      "Kommentar" = "notes_bonbons",
+                      "Diminutiv" = "diminutive_bonbons")) |> 
+  pivot_wider(names_from = type, 
+              values_from = value, 
+              values_fn = ~ first(.x[!is.na(.x)]))
+
+#annotation_weg <- create_variable_df(annotation, 144) #also in word-final /g/
+
+#bisschen/Stückchen:
+annotation_bisschenStückchen <- create_variable_df(annotation, 153)
+annotation_bisschenStückchen <- annotation_bisschenStückchen |> 
+    mutate(type = recode(type,
+                      "Transkription" = "transcription_bisschenStückchen",
+                      "Transkription_Variante" = "transcription_v_bisschenStückchen",
+                      "Kommentar" = "notes_bisschenStückchen",
+                      "Diminutiv" = "biss")) |> 
+  pivot_wider(names_from = type, 
+              values_from = value, 
+              values_fn = ~ first(.x[!is.na(.x)]))
+
+```
+
+```{r prep-coronalisation, include=FALSE}
+
+#Milch:
+annotation_milch <- create_variable_df(annotation, 226)
+annotation_milch <- annotation_milch |> 
+    mutate(type = recode(type,
+                      "Transkription" = "transcription_milch",
+                      "Annotation_Auslaut" = "milch",
+                      "Koronalisierung" = "coronalisation_milch",
+                      "Annotation_Lexik" = "lexical_milch",
+                      "Annotation_LexikVariante" = "lexical_variant_milch")) |> 
+  pivot_wider(names_from = type, 
+              values_from = value, 
+              values_fn = ~ first(.x[!is.na(.x)]))
+
+```
+
+```{r prep-pf-onset, include=FALSE}
+
+#Pfütze:
+annotation_pfuetze <- create_variable_df(annotation, 191)
+annotation_pfuetze <- annotation_pfuetze |> 
+    mutate(type = recode(type,
+                      "Transkription" = "transcription_pfuetze",
+                      "Transkription_Variante" = "transcription_v_pfuetze",
+                      "Annotation_Anlaut" = "pfuetze",
+                      "Kommentar" = "notes_pfuetze")) |> 
+  pivot_wider(names_from = type, 
+              values_from = value, 
+              values_fn = ~ first(.x[!is.na(.x)]))
+
+```
+
+```{r prep-prefect-auxiliary, include=FALSE}
+
+#Buch angefangen:
+annotation_buch_angef <- create_variable_df(annotation, 79)
+annotation_buch_angef <- annotation_buch_angef |> 
+    mutate(type = recode(type,
+                      "Annotation_Auxilliar" = "buch_angef")) |> 
+  pivot_wider(names_from = type, 
+              values_from = value, 
+              values_fn = ~ first(.x[!is.na(.x)]))
+
+#mit Krafttraining angefangen:
+annotation_training_angef <- create_variable_df(annotation, 80)
+annotation_training_angef <- annotation_training_angef |> 
+    mutate(type = recode(type,
+                      "Annotation_Auxilliar" = "training_angef")) |> 
+  pivot_wider(names_from = type, 
+              values_from = value, 
+              values_fn = ~ first(.x[!is.na(.x)]))
+
+#angefangen zu schreiben:
+annotation_schreiben_angef <- create_variable_df(annotation, 81)
+annotation_schreiben_angef <- annotation_schreiben_angef |> 
+    mutate(type = recode(type,
+                      "Annotation_Auxilliar" = "schreiben_angef")) |> 
+  pivot_wider(names_from = type, 
+              values_from = value, 
+              values_fn = ~ first(.x[!is.na(.x)]))
+
+#gerade angefangen:
+annotation_gerade_angef <- create_variable_df(annotation, 82)
+annotation_gerade_angef <- annotation_gerade_angef |> 
+    mutate(type = recode(type,
+                      "Annotation_Auxilliar" = "gerade_angef")) |> 
+  pivot_wider(names_from = type, 
+              values_from = value, 
+              values_fn = ~ first(.x[!is.na(.x)]))
+
+#beim Anwalt angefangen:
+annotation_beim_anwalt_angef <- create_variable_df(annotation, 83)
+annotation_beim_anwalt_angef <- annotation_beim_anwalt_angef |> 
+    mutate(type = recode(type,
+                      "Transkription" = "beim_anwalt_angef",
+                      "Transkription_Variante" = "v_beim_anwalt_angef",
+                      "Kommentar" = "notes_beim_anwalt_angef")) |> 
+  pivot_wider(names_from = type, 
+              values_from = value, 
+              values_fn = ~ first(.x[!is.na(.x)]))
+
+```
+
+```{r prep-progressive, include=FALSE}
+
+#es regnet stark:
+annotation_stark_regnen <- create_variable_df(annotation, 89)
+annotation_stark_regnen <- annotation_stark_regnen |> 
+    mutate(type = recode(type,
+                      "Transkription" = "transcription_stark_regnen",
+                      "TranskriptionVariante_1" = "transcription_v1_stark_regnen",
+                      "TranskriptionVariante_3" = "transcription_v2_stark_regnen",
+                      "TranskriptionVariante_4" = "transcription_v3_stark_regnen",
+                      "vulgär" = "vulgar_stark_regnen",
+                      "Annotation_amP" = "stark_regnen",
+                      "dretschen" = "dretschen_stark_regnen",
+                      "pipi" = "urine_expression_stark_regnen",
+                      "Annotation_ObjektSubjekt" = "complement_stark_regnen",
+                      "Annotation_ObjektVariante_2" = "complement_v_stark_regnen",
+                      "Annotation_Verb" = "lexeme_stark_regnen",
+                      "Kommentar" = "notes_stark_regnen")) |> 
+  pivot_wider(names_from = type, 
+              values_from = value, 
+              values_fn = ~ first(.x[!is.na(.x)]))
+
+#Vögel baden:
+annotation_voegel_baden <- create_variable_df(annotation, 169)
+annotation_voegel_baden <- annotation_voegel_baden |>
+    mutate(type = recode(type,
+                      "Transkription" = "transcription_voegel_baden",
+                      "Annotation_am-Progressiv" = "am_voegel_baden",
+                      "Annotation_Progressiv" = "voegel_baden",
+                      "Annotation_Reflexiv" = "reflexive_voegel_baden",
+                      "Annotation_ErgänzungProg" = "adjunct_voegel_baden",
+                      "Annotation_ProgressivNeu" = "voegel_baden",
+                      "Annotation_Verb" = "lexeme_voegel_baden",
+                      "Kommentar" = "notes_voegel_baden")) |> 
+  pivot_wider(names_from = type, 
+              values_from = value, 
+              values_fn = ~ first(.x[!is.na(.x)]))
+
+#Zwiebel schneiden:
+annotation_zwiebel_schneiden <- create_variable_df(annotation, 170)
+annotation_zwiebel_schneiden <- annotation_zwiebel_schneiden |> 
+    mutate(type = recode(type,
+                      "Transkription" = "transcription_zwiebel_schneiden",
+                      "Transkription_Variante" = "transcription_v_zwiebel_schneiden",
+                      "Annotation_am-Progressiv" = "am_zwiebel_schneiden",
+                      "Annotation_Progressiv" = "zwiebel_schneiden",
+                      "Annotation_Objekt" = "obj_incorporated_zwiebel_schneiden",
+                      "Kommentar" = "notes_zwiebel_schneiden")) |> 
+  pivot_wider(names_from = type, 
+              values_from = value, 
+              values_fn = ~ first(.x[!is.na(.x)]))
+
+#Ist Martin zu sprechen?
+annotation_martin_sprechen <- create_variable_df(annotation, 286)
+annotation_martin_sprechen <- annotation_martin_sprechen |> 
+    mutate(type = recode(type,
+                      "Transkription" = "transcription_martin_sprechen",
+                      "Annotation_am-Progressiv" = "am_prog_martin_sprechen",
+                      "Progressiv" = "prog_martin_sprechen",
+                      "Kommentar" = "notes_martin_sprechen")) |> 
+  pivot_wider(names_from = type, 
+              values_from = value, 
+              values_fn = ~ first(.x[!is.na(.x)]))
+
+#nicht gestört werden:
+annotation_nicht_gestoert_werden <- create_variable_df(annotation, 287)
+annotation_nicht_gestoert_werden <- annotation_nicht_gestoert_werden |> 
+    mutate(type = recode(type,
+                      "Transkription" = "transcription_nicht_gestoert_werden",
+                      "Transkription_Variante" = "transcription_v_nicht_gestoert_werden",
+                      "Transkription_Variante2" = "transcription_v2_nicht_gestoert_werden",
+                      "Transkription_Variante3" = "transcription_v3_nicht_gestoert_werden",
+                      "Annotation_arbeiten" = "lexeme_nicht_gestoert_werden",
+                      "Annotation_Progressiv" = "prog_nicht_gestoert_werden",
+                      "Annotation_ArtikelVorname" = "det_name_nicht_gestoert_werden",
+                      "Kommentar" = "notes_nicht_gestoert_werden")) |> 
+  pivot_wider(names_from = type, 
+              values_from = value, 
+              values_fn = ~ first(.x[!is.na(.x)]))
+
+```
+
+```{r prep-split-construction, include=FALSE}
+
+#Da[von] habe ich noch nichts [von] gehört:
+annotation_nichtsgehört <- create_variable_df(annotation, 77)
+annotation_nichtsgehört <- annotation_nichtsgehört |> 
+    mutate(type = recode(type,
+                      "Transkription" = "transcription_nichtsgehört",
+                      "Transkription_Variante" = "transcription_v_nichtsgehört",
+                      "Annotation_AnlautPräp" = "onset_preposition_nichtsgehört",
+                      "Annotation_Typ" = "split_constr_nichtsgehört",
+                      "Annotation_Typ_Variante" = "split_constr_v_nichtsgehört",
+                      "Kommentar" = "notes_nichtsgehört")) |> 
+  pivot_wider(names_from = type, 
+              values_from = value, 
+              values_fn = ~ first(.x[!is.na(.x)]))
+
+#Da[zu] habe ich keine Lust [zu]:
+annotation_keine_lust <- create_variable_df(annotation, 78)
+annotation_keine_lust <- annotation_keine_lust |> 
+    mutate(type = recode(type,
+                      "Transkription" = "transcription_keine_lust",
+                      "Transkription_Variante" = "transcription_v_keine_lust",
+                      "Annotation_AnlautPräp" = "onset_preposition_keine_lust",
+                      "Annotation_Typ" = "split_constr_keine_lust",
+                      "Annotation_LustPräp" = "lust_preposition_v_keine_lust", 
+                      "Annotation_BockPräp" = "bock_preposition_v_keine_lust", 
+                      "Annotation_Präpositionaladverb" = "keine_lust")) |> 
+  pivot_wider(names_from = type, 
+              values_from = value, 
+              values_fn = ~ first(.x[!is.na(.x)]))
+
+#table(annotation_keine_lust$type)
+
+```
+
+```{r join-variable-dfs, include=FALSE}
+
+annotation_all_variables <- bind_rows(annotation_fahrrad, annotation_omaopa, annotation_kruemel, annotation_kaffee, annotation_weg, annotation_zug, annotation_berg, annotation_bisschen, annotation_pinnchen, annotation_bonbons, annotation_bisschenStückchen, annotation_milch, annotation_pfuetze, annotation_buch_angef, annotation_training_angef, annotation_schreiben_angef, annotation_gerade_angef, annotation_beim_anwalt_angef, annotation_stark_regnen, annotation_voegel_baden, annotation_zwiebel_schneiden, annotation_martin_sprechen, annotation_nicht_gestoert_werden, annotation_nichtsgehört, annotation_keine_lust)
+
+annotation_all_variables |> 
+  rename()
+
+```
+
+```{r join-metadata, include=FALSE}
+
+annotation_all_variables <- metaData |> 
+  left_join(annotation_all_variables, by = "survey_result_id")
+
+```
+
+```{r, include=FALSE}
+
+all_task_ids <- annotation_all_variables |> 
+  distinct(task_id) |>
+  filter(!is.na(task_id))
+
+length(all_task_ids$task_id) 
+
+```
+
+```{r, include=FALSE}
+
+num_answers_per_participant <- annotation_all_variables |> 
+  group_by(survey_result_id) |> 
+  summarise(
+    num_tasks_answered = n_distinct(task_id))
+
+```
+
+```{r, include=FALSE}
+
+participants_per_num_tasks <- num_answers_per_participant |> 
+  count(num_tasks_answered) |> 
+  arrange(desc(num_tasks_answered))
+
+```
+
+```{r, include=FALSE}
+
+participants_with_20more_answers <- num_answers_per_participant |> 
+  filter(num_tasks_answered >= 20)
+
+participants_with_10more_answers <- num_answers_per_participant |> 
+  filter(num_tasks_answered >= 10)
+
+```
+
+```{r, include=FALSE}
+
+annotation_filtered_20more_pre <- annotation_all_variables |> 
+  filter(survey_result_id %in% participants_with_20more_answers$survey_result_id)
+
+#sanity check:
+sample_size <- annotation_filtered_20more_pre |> 
+  summarise(unique_participants = n_distinct(survey_result_id))
+
+```
+
+```{r, include=FALSE}
+
+#filter out variables with little coverage:
+annotation_filtered_20more <- annotation_filtered_20more_pre |> 
+  filter(!task_id %in% c(270, 281, 286, 287))
+
+```
+
+```{r inspect-critical-lexemes, include=FALSE}
+
+#vowel length
+#Fahrrad:
+fahrrad_freq_table <- table(annotation_fahrrad$transcription_fahrrad)
+prop.table(fahrrad_freq_table) #0.7446471055 "Fahrrad" (939 persons) -> impute
+#Krümel:
+kruemel_freq_table <- table(annotation_kruemel$lexeme_kruemel)
+prop.table(kruemel_freq_table) #0.9126038281 "Krümel" + 0.0003611412 "Krümmel" (1 person, including it is pointless)
+#Kaffee:
+kaffee_freq_table <- table(annotation_kaffee$transcription_kaffee)
+prop.table(kaffee_freq_table) #already excluded (see below)
+
+#word-final /g/ following front vowel:
+#Weg:
+#weg_freq_table <- table(annotation_weg$transcription_weg)
+#weg_prop_table <- prop.table(weg_freq_table) #(763 persons)
+#weg_cum_percentage <- sum(weg_prop_table[grepl("(W|w)eg$", names(weg_prop_table))]) #0.2075542 -> exclude
+#weg_freq_table <- table(annotation_weg$coda_Weg) 
+#weg:
+weg2_freq_table <- table(annotation_kruemel$preposition_kruemel)
+weg2_prop_table <- prop.table(weg2_freq_table)
+we_cum_percentage <- sum(weg2_prop_table[grepl("we", names(weg2_prop_table))]) #0.7909955 "we" -> try imputing 
+
+#/g/ after velar vocal
+#Zug:
+zug_freq_table <- table(annotation_zug$transcription_zug)
+zug_prop_table <- prop.table(zug_freq_table) 
+ts_cum_percentage <- sum(zug_prop_table[grepl("ts", names(zug_prop_table))]) #0.7576923 "(Z|z)ug" -> try imputing
+
+#diminutive
+#bisschen:
+bisschen_freq_table <- table(annotation_bisschen$transcription_bisschen)
+bisschen_prop_table <- prop.table(bisschen_freq_table)
+bis_cum_percentage <- sum(bisschen_prop_table[grepl("bis", names(bisschen_prop_table))]) #0.5392372 -> exclude
+#Pinnchen:
+pinnchen_freq_table <- table(annotation_pinnchen$transcription_pinnchen)
+pinnchen_prop_table <- prop.table(pinnchen_freq_table)
+pinn_cum_percentage <- sum(pinnchen_prop_table[grepl("(P|p)inn.*(ch|k)e(n|s)", names(pinnchen_prop_table))])
+#Bonbons:
+bonbons_freq_table <- table(annotation_bonbons$transcription_bonbons)
+bonbons_prop_table <- prop.table(bonbons_freq_table)
+bonbons_cum_percentage <- sum(bonbons_prop_table[grepl("Bonbons|Bömmskes", names(bonbons_prop_table))]) 
+sum(bonbons_prop_table[grepl("chen|ke(n|s)", names(bonbons_prop_table))]) #0.3708207 exclude
+#bisschenStückchen:
+bisschenStückchen_freq_table <- table(annotation_bisschenStückchen$transcription_bisschenStückchen)
+bisschenStückchen_prop_table <- prop.table(bisschenStückchen_freq_table)
+sum(bisschenStückchen_prop_table[grepl("bis", names(bisschenStückchen_prop_table))]) #0.5630821
+sum(bisschenStückchen_prop_table[grepl("Stück", names(bisschenStückchen_prop_table))]) #0.1850127
+sum(bisschenStückchen_prop_table[grepl("chen|ken", names(bisschenStückchen_prop_table))]) #0.7967824
+
+#pf (vs. f) in onset:
+#Pfütze:
+pfuetze_freq_table <- table(annotation_pfuetze$transcription_pfuetze)
+pfuetze_prop_table <- prop.table(pfuetze_freq_table)
+sum(pfuetze_prop_table[grepl("ütze", names(pfuetze_prop_table))]) #0.8752726
+
+#split constructions (pronominal adverbs):
+#nichts gehört:
+nichtsgehört_freq_table <- table(annotation_nichtsgehört$split_constr_nichtsgehört)
+prop.table(nichtsgehört_freq_table) #0.23 split; 0.2 non-split; 0.46 "das" -> exclude
+#keine Lust:
+keine_lust_freq_table <- table(annotation_keine_lust$keine_lust)
+prop.table(keine_lust_freq_table) #>0.7 splitable forms -> try imputing
+
+```
+
+```{r create-df, include=FALSE}
+
+#colnames(annotation_all_variables)
+
+df <- annotation_filtered_20more |>
+  select(survey_result_id, education_level:Altersklasse, transcription_fahrrad:transcription_v_keine_lust) |>
+  group_by(survey_result_id) |>
+  summarise(
+    across(education_level:Altersklasse,
+           ~ first(na.omit(.)), 
+           .names = "{.col}"),
+    across(transcription_fahrrad:transcription_v_keine_lust,
+           ~ first(na.omit(.)), 
+           .names = "{.col}"),
+    .groups = "drop"
+  )
+
+```
+
+```{r preprocessing-vowellength, include=FALSE}
+
+#Fahrrad, Oma
+fahr_freq_table <- table(df$fahr)
+prop.table(fahr_freq_table)
+rad_freq_table <- table(df$vowellength_rad)
+prop.table(rad_freq_table)
+oma_freq_table <- table(df$oma)
+prop.table(oma_freq_table)
+
+df <- df |> 
+  mutate(
+    fahr = recode(fahr, "kurzer Vokal" = "short", "langer Vokal" = "long"),
+    vowellength_rad = recode(vowellength_rad, "kurzer Vokal" = "short", "langer Vokal" = "long"),
+    oma = recode(oma, "Kurzvokal" = "short", "Langvokal" = "long"), 
+    opa = recode(opa, "Kurzvokal" = "short", "Langvokal" = "long")
+  )
+
+```
+
+```{r preprocessing-coda-onset, include=FALSE}
+
+#berg, milch, pfuetze
+berg_freq_table <- table(df$berg)
+prop.table(berg_freq_table)
+milch_freq_table <- table(df$milch)
+prop.table(milch_freq_table)
+pfuetze_freq_table <- table(df$pfuetze)
+prop.table(pfuetze_freq_table)
+
+df <- df |>
+  mutate(
+    berg = case_when(
+      berg == "auf´m Berch" ~ "ç/ʃ",
+      berg == "Bärch" ~ "ç/ʃ",
+      berg == "Berch" ~ "ç/ʃ",
+      berg == "Ber(s)ch" ~ "ç/ʃ",
+      berg == "Beresch" ~ "ç/ʃ",
+      berg == "Bersch" ~ "ç/ʃ",
+      berg == "Berk" ~ "k",
+      berg == "Berrk" ~ "k",
+      TRUE ~ NA_character_),
+    milch = case_when(
+      milch == "ɕ" ~ "ʃ",
+      TRUE ~ milch),
+    pfuetze = case_when(
+      pfuetze == "p" ~ NA_character_,
+      pfuetze == "f, pf" ~ NA_character_,
+      TRUE ~ pfuetze
+    )
+    )
+
+#Berg:
+#ç          k          ʃ 
+#0.33013436 0.65259117 0.01727447 -> group! (both spirants)
+
+#Milch:
+#         ç          ʃ 
+#0.91038697 0.08961303  
+
+#Pfütze:
+#        f        pf 
+#0.5180266 0.4819734 -> OK!
+
+df <- df |> 
+  filter(milch != "k" | is.na(milch))
+
+sample_size <- nrow(df)
+
+```
+
+```{r preprocessing-aux, include=FALSE}
+
+#gerade_angef, schreiben_angef, buch_angef, training_angef, beim_anwalt_angef
+gerade_angef_freq_table <- table(df$gerade_angef)
+prop.table(gerade_angef_freq_table)
+schreiben_angef_freq_table <- table(df$schreiben_angef)
+prop.table(schreiben_angef_freq_table)
+buch_angef_freq_table <- table(df$buch_angef)
+prop.table(buch_angef_freq_table)
+training_angef_freq_table <- table(df$training_angef)
+prop.table(training_angef_freq_table)
+beim_anwalt_angef_freq_table <- table(df$beim_anwalt_angef)
+prop.table(beim_anwalt_angef_freq_table)
+
+df <- df |> 
+  mutate(
+    gerade_angef = case_when(
+      gerade_angef == "habenSein" ~ NA_character_,
+      gerade_angef == "leer" ~ NA_character_,
+      gerade_angef == "Präsens" ~ NA_character_,
+      TRUE ~ gerade_angef
+    ),
+    schreiben_angef = case_when(
+      schreiben_angef == "habenSein" ~ NA_character_,
+      schreiben_angef == "leer" ~ NA_character_,
+      schreiben_angef == "Präsens" ~ NA_character_,
+      TRUE ~ schreiben_angef
+    ),
+    training_angef = case_when(
+      training_angef == "habenSein" ~ NA_character_,
+      training_angef == "leer" ~ NA_character_,
+      training_angef == "Präsens" ~ NA_character_,
+      training_angef == "Futur" ~ NA_character_,
+      training_angef == "ModalverbPräsens" ~ NA_character_,
+      training_angef == "Präterium" ~ NA_character_,
+      TRUE ~ training_angef
+    ),
+    beim_anwalt_angef = case_when(
+      beim_anwalt_angef == "Nein" ~ NA_character_,
+      TRUE ~ beim_anwalt_angef
+    )
+  )
+
+#More potential questions/tasks measuring auxiliary "haben" vs. "sein" (excluded for interpretability, but including or varying them does not substantially change MCA results):
+
+#####> prop.table(beim_anwalt_angef_freq_table)
+#     haben      sein 
+# 0.8143813 0.1856187 
+# > 
+# > #gerade_angef, schreiben_angef, buch_angef, training_angef, beim_anwalt_angef
+# > gerade_angef_freq_table <- table(df$gerade_angef)
+# > prop.table(gerade_angef_freq_table)
+# 
+#     haben      sein 
+# 0.8697124 0.1302876 
+# > schreiben_angef_freq_table <- table(df$schreiben_angef)
+# > prop.table(schreiben_angef_freq_table)
+# 
+#      haben       sein 
+# 0.92176871 0.07823129 
+# > buch_angef_freq_table <- table(df$buch_angef)
+# > prop.table(buch_angef_freq_table)
+# 
+#      haben       sein 
+# 0.95854922 0.04145078 
+# > training_angef_freq_table <- table(df$training_angef)
+# > prop.table(training_angef_freq_table)
+# 
+#      haben       sein 
+# 0.92033898 0.07966102 
+# > beim_anwalt_angef_freq_table <- table(df$beim_anwalt_angef)
+# > prop.table(beim_anwalt_angef_freq_table)
+# 
+#     haben      sein 
+# 0.8143813 0.1856187 
+
+```
+
+```{r preprocessing-progressive, include=FALSE}
+
+#stark_regnen, voegel_baden, zwiebel_schneiden:
+stark_regnen_freq_table <- table(df$stark_regnen)
+prop.table(stark_regnen_freq_table)
+voegel_baden_freq_table <- table(df$voegel_baden)
+prop.table(voegel_baden_freq_table)
+zwiebel_schneiden_freq_table <- table(df$zwiebel_schneiden)
+prop.table(zwiebel_schneiden_freq_table)
+
+# > prop.table(stark_regnen_freq_table)
+# 
+#         no        yes 
+# 0.97508306 0.02491694 -> excluded
+# > voegel_baden_freq_table <- table(df$voegel_baden)
+# > prop.table(voegel_baden_freq_table)
+# 
+#         no        yes 
+# 0.96843854 0.03156146 
+# > zwiebel_schneiden_freq_table <- table(df$zwiebel_schneiden)
+# > prop.table(zwiebel_schneiden_freq_table) 
+# 
+#         no        yes 
+# 0.97342193 0.02657807 -> excluded
+
+```
+
+```{r preprocessing-split-constr, include=FALSE}
+
+keine_lust_freq_table <- table(df$keine_lust)
+prop.table(keine_lust_freq_table)
+
+df <- df |>
+  mutate(
+    keine_lust = case_when(
+      keine_lust == "1, 4" ~ "split", #corrected annotation
+      keine_lust == "da drauf" ~ "split",
+      keine_lust == "da…dazu" ~ "split",
+      keine_lust == "da…Präp" ~ "split",
+      keine_lust == "da...zu" ~ "split",
+      keine_lust == "da...nach" ~ "split",
+      keine_lust == "da...zu" ~ "split",
+      keine_lust == "NULL…Präp" ~ "split", #Ellipse split
+      keine_lust == "dazu/darauf" ~ "non-split",
+      keine_lust == "da…NULL" ~ "non-split", #Ellipse non-split
+      keine_lust == "Null" ~ NA_character_,
+      TRUE ~ keine_lust))
+
+#keine Lust:
+#non-split     split 
+# 0.177453  0.822547 
+
+```
+
+```{r more-checks, include=FALSE}
+
+#task152:
+kruemel_weg_freq_table <- table(df$preposition_kruemel)
+prop.table(kruemel_weg_freq_table) 
+
+df <- df |>
+  mutate(
+    preposition_kruemel = case_when(
+      preposition_kruemel == "wech" ~ "ç",
+      preposition_kruemel == "weg" ~ "k",
+      preposition_kruemel == "da weg" ~ "k",
+      preposition_kruemel == "auf" ~ NA_character_,
+      preposition_kruemel == "ab" ~ NA_character_,
+      preposition_kruemel == "fott" ~ NA_character_,
+      preposition_kruemel == "hier auf" ~ NA_character_,
+      preposition_kruemel == "off" ~ NA_character_,
+      preposition_kruemel == "vom Tisch" ~ NA_character_,
+      preposition_kruemel == "zusammen" ~ NA_character_,
+      TRUE ~ preposition_kruemel)) |> 
+  rename(weg = preposition_kruemel)
+
+#> prop.table(kruemel_weg_freq_table)
+#        ç         k 
+#0.2074592 0.7925408 
+
+bisschenStückchen_freq_table <- table(df$bis)
+prop.table(bisschenStückchen_freq_table) 
+
+#> prop.table(bisschenStückchen_freq_table)
+
+#     chen       ken 
+#0.8306265 0.1693735 
+
+pinnchen_freq_table <- table(df$pinn)
+prop.table(pinnchen_freq_table) 
+
+#> prop.table(pinnchen_freq_table)
+
+#     chen       ken 
+#0.5656192 0.4343808
+
+```
+
+```{r freq-fahrXrad, include=FALSE}
+
+fahrrad_dependency_check_df <-table(annotation_fahrrad$fahr, annotation_fahrrad$vowellength_rad)
+
+```
+
+```{r check-oma-opa-diff, include=FALSE}
+
+#vowel length Oma and Opa:
+identical(annotation_omaopa$oma, annotation_omaopa$opa)
+
+diff_omaopa <- which(annotation_omaopa$oma != annotation_omaopa$opa)
+
+diff_omaopa_df <- annotation_omaopa[diff_omaopa, ]
+
+```
+
+```{r check-g-diff, include=FALSE}
+
+#BergXweg:
+bergXweg <- which(df$berg != df$weg)
+bergXweg_df <- df[bergXweg, ] |> 
+  select(survey_result_id, berg, weg)
+
+```
+
+```{r check-diminutive-diff, include=FALSE}
+
+#bisschenStückchenXPinnchen:
+bisschenStückchenXpinnchen <- which(df$biss != df$pinn)
+bisschenStückchenXpinnchen_df <- df[bisschenStückchenXpinnchen, ] |> 
+  select(survey_result_id, biss, pinn)
+
+```
+
+```{r check-auxiliary-diffs, include=FALSE}
+
+#auxiliary alternation
+diff_aux_variation <- which(
+  (df$schreiben_angef != df$beim_anwalt_angef) &
+  (df$schreiben_angef != df$buch_angef) &
+  (df$schreiben_angef != df$gerade_angef) & df$schreiben_angef != df$training_angef &
+    df$schreiben_angef != "" &
+    df$schreiben_angef != "leer")
+
+diff_aux_variation_df <- df[diff_aux_variation, ] |> 
+  select(survey_result_id, schreiben_angef, beim_anwalt_angef, buch_angef, gerade_angef, training_angef)
+
+#schreibenXanwalt
+schreibenXanwalt <- which(df$schreiben_angef != df$beim_anwalt_angef &
+             df$schreiben_angef != "" &
+             df$schreiben_angef != "leer" &
+             df$beim_anwalt_angef != "")
+schreibenXanwalt_df <- df[schreibenXanwalt, ] |> 
+  select(survey_result_id, schreiben_angef, beim_anwalt_angef)
+
+#anwaltXbuch
+anwaltXbuch <- which(df$beim_anwalt_angef != df$buch_angef &
+             df$schreiben_angef != "" &
+             df$buch_angef != "")
+anwaltXbuch_df <- df[anwaltXbuch, ] |> 
+  select(survey_result_id, buch_angef, beim_anwalt_angef)
+
+#schreibenXbuch
+schreibenXbuch <- which(df$schreiben_angef != df$buch_angef &
+             df$schreiben_angef != "" &
+             df$schreiben_angef != "leer" &
+             df$buch_angef != "")
+schreibenXbuch_df <- df[schreibenXbuch, ] |> 
+  select(survey_result_id, schreiben_angef, buch_angef)
+
+#schreibenXgerade
+schreibenXgerade <- which(
+  df$schreiben_angef != df$gerade_angef &
+  df$schreiben_angef != "" &
+    df$schreiben_angef != "leer" &
+  df$gerade_angef != ""
+)
+schreibenXgerade_df <- df[schreibenXgerade, ] |>  
+  select(survey_result_id, schreiben_angef, gerade_angef)
+
+#schreibenXkrafttraining
+schreibenXkrafttraining <- which(
+  df$schreiben_angef != df$training_angef &
+  df$schreiben_angef != "" &
+    df$schreiben_angef != "leer" &
+  df$training_angef != ""
+)
+schreibenXkrafttraining_df <- df[schreibenXkrafttraining, ] |>  
+  select(survey_result_id, schreiben_angef, training_angef)
+
+#anwaltXgerade
+anwaltXgerade <- which(
+  df$beim_anwalt_angef != df$gerade_angef &
+  df$beim_anwalt_angef != "" &
+  df$gerade_angef != ""
+)
+anwaltXgerade_df <- df[anwaltXgerade, ] |>  
+  select(survey_result_id, beim_anwalt_angef, gerade_angef)
+
+#anwaltXkrafttraining
+anwaltXkrafttraining <- which(
+  df$beim_anwalt_angef != df$training_angef &
+  df$beim_anwalt_angef != "" &
+  df$training_angef != ""
+)
+anwaltXkrafttraining_df <- df[anwaltXkrafttraining, ] |>  
+  select(survey_result_id, beim_anwalt_angef, training_angef)
+
+#buchXgerade
+buchXgerade <- which(
+  df$buch_angef != df$gerade_angef &
+  df$buch_angef != "" &
+  df$gerade_angef != ""
+)
+buchXgerade_df <- df[buchXgerade, ] |>  
+  select(survey_result_id, buch_angef, gerade_angef)
+
+#buchXkrafttraining
+buchXkrafttraining <- which(
+  df$buch_angef != df$training_angef &
+  df$buch_angef != "" &
+  df$training_angef != ""
+)
+buchXkrafttraining_df <- df[buchXkrafttraining, ] |>  
+  select(survey_result_id, buch_angef, training_angef)
+
+#geradeXkrafttraining
+geradeXkrafttraining <- which(
+  df$gerade_angef != df$training_angef &
+  df$gerade_angef != "" &
+  df$training_angef != ""
+)
+geradeXkrafttraining_df <- df[geradeXkrafttraining, ] |>  
+  select(survey_result_id, gerade_angef, training_angef)
+
+```
+
+```{r preprocessing-prog, include=FALSE}
+
+#check annotations:
+#table(df$stark_regnen)
+#table(df$am_voegel_baden) 
+#table(df$voegel_baden)
+#table(df$am_prog_martin_sprechen) #annotations still missing, exclude for now
+#table(df$prog_martin_sprechen) #annotations still missing, exclude for now
+#table(df$am_zwiebel_schneiden)
+#table(df$zwiebel_schneiden)
+
+#make progressive columns binary, filter out participants with missing transcriptions (reduce number of NAs):
+#stark regnen
+df <- df |>
+  filter(!is.na(transcription_stark_regnen)) |> 
+  mutate(
+    stark_regnen = case_when(
+      stark_regnen == "am-Progressiv" ~ "prog",
+      is.na(stark_regnen) ~ "simple"))
+#Vögel baden
+df <- df |>
+  filter(!is.na(transcription_voegel_baden)) |>
+  filter(transcription_voegel_baden != "") |> 
+  filter(transcription_voegel_baden != "--") |> 
+  filter(transcription_voegel_baden != "?") |> 
+  mutate(
+    voegel_baden = case_when(
+      voegel_baden == "am" ~ "prog",
+      voegel_baden == "Präs" ~ "simple",
+      voegel_baden == "Präsens" ~ "simple",
+      is.na(voegel_baden) ~ "simple"))
+#Zwiebel schneiden
+df <- df |>
+  filter(!is.na(transcription_zwiebel_schneiden)) |>
+  filter(transcription_zwiebel_schneiden != "?") |> 
+  filter(transcription_zwiebel_schneiden != "--") |> 
+  mutate(
+    zwiebel_schneiden = case_when(
+      zwiebel_schneiden == "Prog" ~ "prog",
+      zwiebel_schneiden == "gerade + Prog" ~ "prog",
+      zwiebel_schneiden == "gerade" ~ "simple",
+      zwiebel_schneiden == "Inf" ~ "simple",
+      zwiebel_schneiden == "Pass" ~ "simple",
+      zwiebel_schneiden == "Präs" ~ "simple",
+      zwiebel_schneiden == "tun-Periphrase" ~ "simple",
+      is.na(zwiebel_schneiden) ~ "simple"))
+
+```
+
+```{r check-prog-diffs, include=FALSE}
+
+#regnenXVögel
+regnenXvoegel <- which(df$stark_regnen != df$voegel_baden)
+regnenXvoegel_df <- df[regnenXvoegel, ] |> 
+  select(survey_result_id, stark_regnen, voegel_baden)
+
+#regnenXZwiebel
+regnenXzwiebel <- which(df$stark_regnen != df$zwiebel_schneiden)
+regnenXzwiebel_df <- df[regnenXzwiebel, ] |> 
+  select(survey_result_id, stark_regnen, zwiebel_schneiden)
+
+#VögelXZwiebel
+voegelXzwiebel <- which(df$voegel_baden != df$zwiebel_schneiden)
+voegelXzwiebel_df <- df[voegelXzwiebel, ] |> 
+  select(survey_result_id, voegel_baden, zwiebel_schneiden)
+
+```
+
+```{r variation-table, include=FALSE}
+
+#create function to compute proportional difference
+get_proportion_diff <- function(x, y) {
+  not_empty <- !is.na(x) & !is.na(y) & x != "" & y != "" & x != "leer" & y != "leer"
+  if (sum(not_empty) == 0) return(NA) #if no pair to compare exists due to missing data, return NA
+  mean(x[not_empty] != y[not_empty]) #x != y compares values and returns TRUE/FALSE; mean returns proportion of TRUE values
+}
+
+#vowel length
+oma_opa_valid <- with(annotation_omaopa, !is.na(oma) & !is.na(opa))
+proportion_diff_omaopa <- mean(annotation_omaopa$oma[oma_opa_valid] != annotation_omaopa$opa[oma_opa_valid])
+
+fahr_rad_valid <- with(annotation_fahrrad, !is.na(fahr) & !is.na(vowellength_rad))
+proportion_diff_fahrrad <- mean(annotation_fahrrad$fahr[fahr_rad_valid] != annotation_fahrrad$vowellength_rad[fahr_rad_valid])
+
+#/g/
+proportion_berg_weg <- get_proportion_diff(df$berg, df$weg)
+
+#diminutive
+proportion_bisschenStückchen_pinnchen <- get_proportion_diff(df$biss, df$pinn)
+
+#auxiliary
+proportion_aux_schreiben_anwalt <- get_proportion_diff(df$schreiben_angef, df$beim_anwalt_angef)
+proportion_aux_anwalt_buch <- get_proportion_diff(df$beim_anwalt_angef, df$buch_angef)
+proportion_aux_schreiben_buch <- get_proportion_diff(df$schreiben_angef, df$buch_angef)
+proportion_aux_schreiben_gerade <- get_proportion_diff(df$schreiben_angef, df$gerade_angef)
+proportion_aux_schreiben_kraft <- get_proportion_diff(df$schreiben_angef, df$training_angef)
+proportion_aux_anwalt_gerade <- get_proportion_diff(df$beim_anwalt_angef, df$gerade_angef)
+proportion_aux_anwalt_kraft <- get_proportion_diff(df$beim_anwalt_angef, df$training_angef)
+proportion_aux_buch_gerade <- get_proportion_diff(df$buch_angef, df$gerade_angef)
+proportion_aux_buch_kraft <- get_proportion_diff(df$buch_angef, df$training_angef)
+proportion_aux_gerade_kraft <- get_proportion_diff(df$gerade_angef, df$training_angef)
+
+#progressive
+proportion_prog_regnen_voegel <- get_proportion_diff(df$stark_regnen, df$voegel_baden)
+proportion_prog_regnen_zwiebel <- get_proportion_diff(df$stark_regnen, df$zwiebel_schneiden)
+proportion_prog_voegel_zwiebel <- get_proportion_diff(df$voegel_baden, df$zwiebel_schneiden)
+
+#create comparison table:
+diff_percentages <- tibble(
+  variables_compared = c(
+    "oma x opa",
+    "fahr x -rad",
+    "berg x weg",
+    "biss x pinn",
+    #"Auxiliary: Schreiben x Anwalt",
+    #"Auxiliary: Anwalt vs. Buch",
+    #"Auxiliary: Schreiben vs. Buch",
+    #"Auxiliary: Schreiben vs. Gerade",
+    "schreiben_angef x training_angef"#,
+    #"Auxiliary: Anwalt vs. Gerade",
+    #"Auxiliary: Anwalt vs. Krafttraining",
+    #"Auxiliary: Buch vs. Gerade",
+    #"Auxiliary: Buch vs. Krafttraining",
+    #"Auxiliary: Gerade vs. Krafttraining",
+    #"Progressive: Stark regnen vs. Vögel baden",
+    #"Progressive: Stark regnen vs. Zwiebel schneiden",
+    #"Progressive: Vögel baden vs. Zwiebel schneiden"
+  ),
+  proportion_different = round(c(
+    proportion_diff_omaopa,
+    proportion_diff_fahrrad,
+    proportion_berg_weg,
+    proportion_bisschenStückchen_pinnchen,
+    #proportion_aux_schreiben_anwalt,
+    #proportion_aux_anwalt_buch,
+    #proportion_aux_schreiben_buch,
+    #proportion_aux_schreiben_gerade,
+    proportion_aux_schreiben_kraft#,
+    #proportion_aux_anwalt_gerade,
+    #proportion_aux_anwalt_kraft,
+    #proportion_aux_buch_gerade,
+    #proportion_aux_buch_kraft,
+    #proportion_aux_gerade_kraft,
+    #proportion_prog_regnen_voegel,
+    #proportion_prog_regnen_zwiebel,
+    #proportion_prog_voegel_zwiebel
+  ), 2)
+)
+```
+
+```{r prep-metadata, include=FALSE}
+
+table(df$education_level)
+table(df$Altersklasse)
+table(df$Geschlecht)
+
+df <- df |>
+  mutate(
+    education_level = case_when(
+      education_level == "Realschule,Hauptschule" ~ "MidSec",
+      education_level == "Realschule,abgeschlossene Berufsausbildung" ~ "VocTrain",
+      education_level == "Hochschulabschluss,Abitur" ~ "UniDeg",
+      education_level == "Hauptschule,Hochschulabschluss" ~ "UniDeg",
+      education_level == "Abitur,Hochschulabschluss" ~ "UniDeg",
+      education_level == "abgeschlossene Berufsausbildung,Hochschulabschluss" ~ "UniDeg",
+      education_level == "abgeschlossene Berufsausbildung,Hauptschule" ~ "VocTrain",
+      education_level == "abgeschlossene Berufsausbildung,Abitur" ~ "VocTrain",
+      education_level == "noch in schulischer Ausbildung" ~ "inSchool",
+      education_level == "Hauptschule" ~ "MidSec",
+      education_level == "Realschule" ~ "LowSec",
+      education_level == "abgeschlossene Berufsausbildung" ~ "VocTrain",
+      education_level == "Hochschulabschluss" ~ "UniDeg",
+      TRUE ~ education_level)) |> 
+  rename(gender = Geschlecht) |> 
+    mutate(
+    gender = case_when(
+      gender == "weiblich" ~ "female",
+      gender == "männlich" ~ "male",
+      gender == "männlich,weiblich" ~ "both",
+      gender == "weiblich,männlich" ~ "both",
+      gender == "divers" ~ "non-binary",
+      TRUE ~ gender)) |> 
+  rename(age_group = Altersklasse)
+
+table(df$education_level)
+table(df$age_group)
+table(df$gender)
+
+```
+
+```{r, include=FALSE}
+
+table(df$area_name)
+
+#exclude locations that are not in NRW:
+df <- df |> 
+  filter(!(area_name %in% c("Auetal", "Bissendorf", "Bremen", "Buchholz in der Nordheide", "Bünde", "Erlangen", "Eystrup", "Glandorf", "Göttingen", "Hamburg", "Hammah", 
+                         "Hasbergen", "Landshut", "Lengerich", "Olbersdorf", "Osnabrück", "Salzbergen")) | is.na(area_name))
+
+sample_size <- nrow(df)
+
+```
+
+```{r factorise, include=FALSE}
+
+#convert to factors:
+df[] <- lapply(df, factor)
+
+```
+
+```{r create-mca-df, include=FALSE}
+
+#excluded rad & stark regnen & Zwiebel schneiden, beim_anwalt_angef, gerade_angef, buch_angef:
+donNA <- df |> 
+  select(age_group, gender, education_level, fahr, oma, opa, berg, milch, pfuetze, weg, biss, pinn, gerade_angef, schreiben_angef, buch_angef, training_angef, beim_anwalt_angef, stark_regnen, voegel_baden, zwiebel_schneiden, keine_lust)
+
+```
+
+```{r, include=FALSE}
+
+#df with ids for visualisations:
+donNA_with_id <- df |> 
+  select(survey_result_id, age_group, gender, education_level, fahr, oma, opa, berg, milch, pfuetze, weg, biss, pinn, schreiben_angef, training_angef, voegel_baden, keine_lust)
+
+donNA_features <- donNA_with_id |> 
+  select(-survey_result_id)
+
+```
+
+```{r, include=FALSE}
+
+#convert user longitude and latitude to string matching sf object format (for visualisations):
+id_area <- df |> 
+  select(survey_result_id, area_name, user_lng, user_lat) |> 
+  mutate(geometry_str = paste0("POINT (", user_lng, " ", user_lat, ")"))
+
+```
+
+```{r impute-na, include=FALSE}
+
+nb <- estim_ncpMCA(donNA_features) #choose number of components
+ncp_value <- nb$ncp #save number of components
+IndMat <- imputeMCA(donNA_features, ncp=ncp_value) #impute indicator matrix
+
+```
+
+```{r, include=FALSE}
+
+imputed_data <- IndMat$completeObs
+
+imputed_data_with_id <- cbind(survey_result_id = donNA_with_id$survey_result_id, imputed_data)
+
+```
+
+```{r mca, echo=FALSE}
+
+res.mca <- MCA(IndMat$completeObs, quali.sup = c(1:3), graph=FALSE) #perform MCA with imputed data!
+
+```
+
+```{r, include=FALSE}
+
+#MCA coordinates for individuals:
+ind_coords <- res.mca$ind$coord
+
+#join their ids with MCA coordinates:
+mca_for_map <- bind_cols(
+  survey_result_id = imputed_data_with_id$survey_result_id,
+  as.data.frame(ind_coords)
+) |>  
+  left_join(id_area, by = "survey_result_id")
+
+```
+
+```{r, include=FALSE}
+
+#transform geometry_str column to sf data format:
+mca_for_map_ind <- mca_for_map |> 
+  mutate(geometry = sf::st_as_sfc(geometry_str, crs = 25832)) #crs=coordinate reference system; 25832=Europe
+
+```
+
+```{r nrw-shape, include=FALSE}
+
+nrw <- sf::st_read("data/Gemeindegrenze_SHP/Gemeinde_Grenze_nrw_1Mio_2024_v2.shp")
+
+```
+
+{{< pagebreak >}}
+
+\pagenumbering{arabic}
+
+# Introduction {#sec-introduction}
+
+Although dialects have long been studied using quantitative methods, the continuum between dialects and standard language remains largely unexplored. As intermediate varieties, regiolects play a central role in everyday communication in areas where local dialects are disappearing and language standardisation is advancing. However, little is known about their internal structure and geographical distribution. This thesis uses a data-driven approach to investigate regiolect structures, avoiding predefined geographic boundaries and spatial aggregation so that regional linguistic patterns can emerge naturally from the data.
+
+The German federal state of North Rhine-Westphalia provides the geographic context for this thesis. North Rhine-Westphalia shows a high degree of linguistic heterogeneity, making it particularly interesting for studying regional variation. Despite this, data-driven research on regiolects in the state is scarce. Most existing research focuses on selected locations (e.g. @salewski1998homogenitat; @rein2020zuruck; @lanwer2015regionale) and often does not go beyond compiled feature lists (e.g. @niebaum_westfalisch_1977; @lauf1996regional; @mihm2000rolle). Existing atlases, like the "Norddeutscher Sprachatlas" (NOSA) [@elmentaler2015norddeutscher] and "Atlas zur deutschen Alltagssprache" (AdA) [@AdA2003], cover few locations or report feature frequencies per location without analysing patterns. No study has yet applied multivariate, data-driven methods across the entire state.
+
+At the same time, dialectometry has gained importance as a subfield of quantitative linguistics, applying computational and statistical methods to study dialects [@wieling2015advances: 244]. Early work by Séguy [-@seguy1971relation; -@seguy1973dialectometrie] and Goebl [-@goebl1982a; -@goebl1982b] used aggregative approaches, comparing speaker locations on the basis of bundles of linguistic variables rather than individual features. Such approaches group speaker data by administrative units, such as counties, and some studies continue to justify this practice [e.g. @lameli_strukturen_2013; @rede2020]. More recent research, however, increasingly focuses on identifying latent dialect structures while preserving individual linguistic variation and gradual transitions [@wieling2015advances: 248-250]. Some of these approaches build on dimensionality reduction techniques, such as Factor Analysis and Principal Component Analysis (PCA) [@shackleton2005english; @hyvonen2007multivariate; @proell2015latente; @szmrecsanyi_grammatical_2012; @vergeiner_quantitative_2023]. These methods are particularly useful for identifying fuzzy dialect areas without clear boundaries [@pickl_fuzzy_2016: 82-83]. Although not yet widely applied, Multiple Correspondence Analysis (MCA) also shows potential in this context [@szmrecsanyi2017featurometry; @Röthlisberger2019].
+
+Applying dialectometric methods to large-scale data on regiolects spoken in North Rhine-Westphalia offers a promising way to address the limitations of earlier studies. This thesis aims to fill the research gap by applying dimensionality reduction to crowdsourced data collected across the entire state via the PALAVA app [@palavaApp]. Rather than testing existing theories about regional varieties (e.g. *Westdeutsch* or *Westfälisch*), this thesis adopts a bottom-up statistical approach that allows spatial structures to emerge from the data. The goal is not to produce a comprehensive regiolect map but to explore whether underlying structures can be uncovered through data-driven analysis.
+
+The statistical approach I apply in this thesis is MCA, a multivariate statistical technique for dimensionality reduction. Although MCA has rarely been used in dialectometry, it is specifically designed for analysing participants' responses to categorical variables [@husson_exploratory_2017: 131–133], which are common in linguistic research. I conduct MCA solely on linguistic variables, with geography serving only as a visualisation layer for mapping resulting regiolect patterns. Moreover, I use the exact longitude and latitude corresponding to the place where each speaker was most linguistically influenced during their life, rather than aggregating speakers per city, municipality, or county.
+
+This thesis begins by outlining the theoretical background to regional linguistic variation in North Rhine-Westphalia and the quantitative methods used in dialectometry, focusing on dimensionality reduction (@sec-background). @sec-data-and-methods describes the methodology and rationale for using MCA, presents the PALAVA dataset, and details the processes of variable selection and preprocessing. The results are reported in @sec-results and discussed in @sec-discussion. Finally, @sec-conclusion summarises the main findings and outlines implications for future research.
+
+# Regional Linguistic Variation and Quantitative Approaches {#sec-background}
+
+This chapter outlines the theoretical and methodological framework for analysing regiolects in North Rhine-Westphalia using a data-driven approach. Although dialects are no longer widely spoken in the state, areal variation still exists, primarily in the form of regiolects. To understand their development, I first provide a general overview of the dialect landscape in North Rhine-Westphalia, as it forms the basis of contemporary regiolects. This is followed by an introduction to the concept of regiolects. This chapter does not describe linguistic features in detail. Instead, these are covered in @sec-variable-selection, where the selected variables are described based on previous research.
+
+The chapter then provides an overview of existing quantitative approaches from the linguistic subfield of dialectometry, with a focus on dimensionality reduction methods. These methods can be used to analyse regiolect data without predefined geographic boundaries, preserving individual linguistic variation and enabling the identification of the linguistic features that comprise a variety.
+
+## Regional Linguistic Variation in North Rhine-Westphalia
+
+### Dialect Morphology in North Rhine-Westphalia {#sec-dialects}
+
+Cornelissen [-@cornelissen_sprachgeschichte_2015: 73] refers to North Rhine-Westphalia as *Land der Tausend Dialekte* 'land of a thousand dialects' to emphasise the federal state's rich linguistic diversity. This diversity is illustrated in Cornelissen's map shown in @fig-dialects, published by the @ilr_dialects, which categorises the state into ten distinct dialect areas. The map's structure is based on 19th-century dialect research [@cornelissen_sprachgeschichte_2015: 73], which was the period when systematic studies of German dialects began, marked by Georg Wenker's [-@wenker1877rheinische] work.
+
+![Dialects in North Rhine-Westphalia [@ilr_dialects]](images/cornelissen_dialekte.jpg){#fig-dialects}
+
+The map in @fig-dialects uses colour-coded location points to represent dialect areas, acknowledging that actual language use is not clear-cut but instead characterised by gradual transitions. Traditional maps, in contrast, marked sharp borders between dialects [@cornelissen_sprachgeschichte_2015: 73]. Two lines are still included in the map in @fig-dialects: the *Benrather Linie* (lower black line) and the *Einheitsplurallinie* (upper black line). While Cornelissen [-@cornelissen_sprachgeschichte_2015: 26] explicitly emphasises that these are not strict borders, they remain important aids for classification.
+
+The *Benrather Linie* separates German dialects which have retained the plosive \ipa{[k]} (as in *maken* 'to make') from those where \ipa{[k]} shifted to \ipa{[ç]} (as in *machen* 'to make') during the Second Sound Shift, a process that unfolded in stages, starting before the 7th century [@cornelissen_sprachgeschichte_2015: 21-22; @schmidt2019historisches: 526]. It also marks other phonological contrasts, such as \ipa{[p]} vs. \ipa{[f]} and \ipa{[t]} vs. \ipa{[s]}, though not consistently across all lexical items. North of the *Benrather Linie* lies the Low German dialect continuum, while south of it are the Central German dialects [@cornelissen_sprachgeschichte_2015: 21-25].
+
+The *Einheitsplurallinie* has been characterised by the phenomenon of the *Einheitsplural*, i.e. the use of a uniform verb ending across all persons in the plural, which is typical of dialects north of the line. Historically, the *Einheitsplurallinie* separates the area with Saxon roots to the north from the area with Franconian roots to the south. In broad terms, one can say that Westphalia corresponds to the Saxon dialect area and the Rhineland to the Franconian dialect area [@cornelissen_sprachgeschichte_2015: 16-17].
+
+According to classic German dialectology, the largest dialect group in North Rhine-Westphalia in terms of spatial extent is *Westfälisch* (green in @fig-dialects). It is further subdivided into *Ostwestfälisch* (around Bielefeld, Detmold, and Paderborn), *Münsterländisch* (covering areas north of the river Lippe such as Rheine, Coesfeld, and Münster), *Westmünsterländisch* (around Bocholt and Borken), and *Südwestfälisch* (south of the Lippe, including Dortmund, Soest, Arnsberg, and Olpe) [@cornelissen_sprachgeschichte_2015: 74-75].
+
+In western North Rhine-Westphalia (marked in red), the *Niederfränkisch* dialect group is shown, which extends far beyond North Rhine-Westphalia into Belgium and the Netherlands, all the way to the North Sea. However, only the portion within North Rhine-Westphalia is shown on the map. This area includes *Kleverländisch* (around Kleve and Duisburg), *Ostbergisch* (Solingen and Gummersbach), and *Südniederfränkisch* (Mönchengladbach and Düsseldorf) [@cornelissen_sprachgeschichte_2015: 73].
+
+The blue area on the map indicates *Ripuarisch* (spoken around Aachen, Cologne, and Siegburg), which also stretches a few kilometers into Belgium and the Netherlands. Additionally, small parts of *Moselfränkisch* (dark blue, e.g. Nordeifel and Siegerland) and *Rheinfränkisch* (light blue, e.g. Wittgenstein and Hallenberg) are found within North Rhine-Westphalia, occupying only minor portions of the state's territory [@cornelissen_sprachgeschichte_2015: 74].
+
+A small dialect enclave (*Dialektinsel*) exists in the Lower Rhine region in western North Rhine-Westphalia near Kleve (around Pfalzdorf, Louisendorf, and Neulouisendorf), where settlers from the Hunsrück established a community in the 18th century. Originally intending to emigrate to America, they settled there instead, maintaining their dialect to this day [@cornelissen_sprachgeschichte_2015: 75].
+
+However, recent quantitative approaches question this traditional classification [@schmidt2019historisches: 515-519]. In particular, @lameli_strukturen_2013 applied methods from biostatistics to reanalyse 64 phonological and morphological variables from Wenker's [-@wenker1888diwa] original survey in his habilitation thesis. His results suggest that the former dialects *Moselfränkisch*, *Ripuarisch*, and *Südniederfränkisch* represent an independent dialect group, referred to as (*historisches) Westdeutsch* or *Rheinisch* (see @fig-lameli-dialects). The most notable feature of *Westdeutsch* is its distinctive tone accents, which distinguish meaning in lexemes and morphemes - a feature unique among West Germanic languages. Another notable feature is the reversal of the long vowel series (e.g. \ipa{[foːs]} instead of \ipa{[fuːs]} for *Fuß* 'foot') [@schmidt2019historisches: 519-521].
+
+![Classification of German dialects according to Lameli [-@lameli_strukturen_2013: 193]](images/Lameli_dialects.png){#fig-lameli-dialects}
+
+This new classification is supported by perception-based research conducted by @purschke2011regionalsprache. According to the study's findings, speakers are still able to assign even the most standard-oriented regiolect speech samples to regions either north or south of the so-called *dat/das-Linie*. This line largely corresponds to the tone accent boundary in the *Westdeutsch* variety group, dialect and regiolect alike [@schmidt2019historisches: 515-519].
+
+These findings underscore the value of quantitative methods for investigating dialects. More importantly for this thesis, they show that *Westdeutsch* and *Westfälisch* - both found in North Rhine-Westphalia - may be classified as two very distinct dialect groups under the new scheme illustrated in @fig-lameli-dialects.
+
+This raises several questions with regard to the current linguistic reality in North Rhine-Westphalia: to what extent do historical dialects shape contemporary regiolects? Do regiolect structures in North Rhine-Westphalia reflect the distinction between *Westdeutsch* and *Westfälisch*? What roles do isoglosses like the *Benrather Linie* play today? What do speakers in North Rhine-Westphalia orient themselves towards in the development of regiolects – does orientation take place according to political boundaries? This thesis cannot fully resolve these questions, but it aims to provide initial insights into how regiolects in North Rhine-Westphalia are structured in the present linguistic landscape and how these structures can be identified.
+
+### The Concept of Regiolects {#sec-regiolects}
+
+Regiolects are intermediate varieties between dialects and the standard language. Schmidt and Herrgen [-@schmidt2011sprachdynamik: 66] define the concept as follows:
+
+> *Eine Regionalsprache ist ein durch Mesosynchronisierungen vernetztes Gesamt an Varietäten und Sprechlagen, das horizontal durch die Strukturgrenzen der Dialektverbände/-regionen und vertikal durch die Differenzen zu den nationalen Oralisierungsnormen der Standardvarietät begrenzt ist.* [@schmidt2011sprachdynamik: 66]
+>
+> 'A regional language is a network of varieties and speech styles linked by mesosynchronisation, which is limited horizontally by the structural boundaries of dialect groups/regions and vertically by the differences to the national oralisation norms of the standard variety.'
+
+In other words, a regiolect is a system of speech styles that is structured in two dimensions: horizontally, by traditional dialect boundaries, and vertically, by the distance from the national standard.
+
+Vertical variation differs from horizontal and diachronic variation, although all three dimensions are interrelated. Regional linguistic variation can also be referred to as vertical areal variation. It describes the systematic adjustments that speakers make to their regional speech depending on the communicative context, in order to align it with the standard. These adjustments occur either because speakers are capable to do so or because they consider it socially appropriate to achieve certain communicative goals. When dialect speakers shift towards the standard, they do so in comparable ways. Consequently, the resulting regiolects are characteristic combinations of regional and standard linguistic features that depend on social conventions [@kehrein2019areale: 121-122].
+
+In the German-speaking world, regiolects are largely the result of historical developments. The rise of Standard German as a written language has created an additional mode of communication alongside local dialects. As certain dialects are structurally closer to Standard German than others, vertical variation differs across regions. In addition, regionally specific pronunciation norms of the written standard, i.e. German, Swiss, or Austrian pronunciation norms, influence vertical areal variation in German speaking countries [@kehrein2019areale: 121-122].
+
+The development of regiolects in North Rhine-Westphalia must therefore be viewed within the context of the long-term developments in the state's dialect landscape. As Schmidt and Möller [-@schmidt2019historisches: 526] point out, the dialect landscape in the Rhineland shows a continuity that stretches from pre-Germanic times to the present-day regiolects. At the same time, the *Westdeutsch* dialects spoken in the Rhineland have been shifting towards Standard German through a series of processes, most importantly the Second Sound Shift (see @sec-dialects) and the New High German diphthongisation (15th/16th centuries). From the 16th century onwards, these linguistic changes went hand in hand with the adoption of Standard German in writing and in the language of the upper classes, ultimately leading to regionally marked speech varieties. Elmentaler [-@elmentaler2005rheinisch: 133] interprets these developments as laying the foundations for a present-day regiolect boundary in North Rhine-Westphalia. He suggests that a northern regiolect based on *Kleverländisch* evolved north of the *Uerdinger Line* (between the *Benrather Linie* and the *Einheitsplurallinie*) whereas a southern regiolect based on *Ripuarisch* emerged in the area between Krefeld and Bonn. [@elmentaler2005rheinisch: 133; @schmidt2019historisches: 526]
+
+Despite these insights on regiolects in North Rhine-Westphalia, data-driven research on their structures remains scarce. While certain linguistic features have been cataloged, e.g. by @niebaum_westfalisch_1977; @lauf1996regional; @mihm2000rolle, studies have focused on individual locations, mainly in the Ruhr area (e.g. Salewski's [-@salewski1998homogenitat] work on Dortmund or Rein's [-@rein2020zuruck] on Erp), or on a few rural regions (e.g. Lanwer's [-@lanwer2015regionale] study of the Westmünsterland). Larger-scale atlas projects provide additional data, but with limitations. The first edition of the "Norddeutscher Sprachatlas" (NOSA) by @elmentaler2015norddeutscher provides regiolect data, but it only covers the area north of the *Benrather Linie*, as its survey boundaries were set according to this traditional dialectological boundary. Because of this, and due to the considerable effort required for data collection [@seiferheld_palava_2023: 91], only 12 locations in North Rhine-Westphalia are included in the NOSA. Moreover, its scope is limited to a set of primarily phonological features. Similarly, the Atlas zur deutschen Alltagssprache (AdA) [@AdA2003] collects data on individual linguistic features, focusing on the frequencies and geographic distributions of individual lexical, phonological, and morphosyntactic variants across Germany, but it does not analyse patterns based on multiple variables. Both atlases also aggregate speaker frequencies per location.
+
+In sum, while previous studies and atlas projects have provided valuable descriptive insights, there is still no multivariate, data-driven study of regional linguistic variation in North Rhine–Westphalia. The present thesis addresses this gap by applying methods from dialectometry.
+
+## Quantitative Approaches in Dialectometry {#sec-dialectometry}
+
+Over the years, the field of dialectometry has evolved to include a range of complex, data-driven methods. A variety of tools have been used, including graph models, spatial statistics, and nonlinear modelling. Within the scope of this thesis, I focus on dimensionality reduction techniques. To motivate their use, it is first necessary to consider the limitations of traditional aggregative approaches.
+
+### Foundations of Dialectometry: Aggregative Approaches
+
+The tradition of European dialectology produced numerous detailed maps showing the geographical distribution of individual linguistic features, such as lexical, phonological, and morphological variants. However, it often struggled to provide coherent results, as it was difficult to define dialect areas based on isolated features alone. Modern dialectology increasingly recognises that geographic distributions forms continua or even scattered settlements rather than discrete boundaries. In this context, dialectometry uses exact methods, mostly computational and statistical approaches, to gain a more systematic understanding of dialect variation [@wieling2015advances: 244].
+
+Wieling and Nerbonne [-@wieling2015advances: 244-245] trace the origins of dialectometry to the foundational contributions of Jean Séguy and Hans Goebl. Séguy [-@seguy1971relation; -@seguy1973dialectometrie] pioneered the field with a transformative approach by examining large aggregates of features instead of isolated features, assessing how frequently two locations differ in their realisations of linguistic forms. This approach was further developed by Goebl [-@goebl1982a; -@goebl1982b], who introduced several important techniques to the field, such as Thiessen polygons, frequency weightings, and cluster analysis. A major innovation in aggregative dialectometry was the use of edit distance (or Levenshtein distance), first applied to dialect data by @kessler1995computational. Edit distance provides a precise way of quantifying phonetic differences by calculating the minimum number of insertions, deletions, or substitutions needed to transform one phonetic string into another [@wieling2015advances: 244-245].
+
+Aggregative approaches based on differences or similarities have since been widely applied in dialectometry, e.g. by @heeringa2004measuring, @heeringa2009variation, @goebl2010dialectometry, and @scherrer2016quantitative. One advantage of these methods is that, by computing pairwise distances between locations, they produce a location $\times$ location distance matrix as an output. This matrix can then be used to visualise dialect areas on geographical maps. Multidimensional Scaling (MDS), for example, is a technique frequently used to create dialect maps. It requires a location $\times$ location distance matrix as input and projects the locations into a low-dimensional space [@wieling2015advances: 245]. As such, MDS functions as a form of dimensionality reduction, similar in purpose to the methods discussed in more detail in @sec-dimensionality-reduction.
+
+A recurring methodological challenge, however, is the tension between administratively defined geographic space and linguistic space. Aggregative approaches group speakers by political units, such as cities or counties, which then serve as the basis for analysis. Since linguistic distributions rarely coincide with administrative units, this procedure inevitably obscures individual variation. Moreover, as Wieling and Nerbonne [-@wieling2015advances: 248-250] point out, dialectometry has rightly been criticised for paying insufficient attention to the individual linguistic features that underlie aggregate geographical patterns. In response to this critique, recent research has sought to emphasise the contribution of individual linguistic features more, and to model gradual transitions rather than sharp spatial boundaries [@szmrecsanyi2017featurometry: 345; @wieling2015advances: 248-250].
+
+Lameli's [-@lameli_strukturen_2013: 31-33] justification for using political units in dialectometry illustrates the issue of spatial aggregation. In his nationwide study of dialectal variation in Germany, he adopted counties as spatial reference units, in line with the REDE project [@rede2020]. His framework is based on the 439 German counties and urban districts. One major advantage of this choice, according to Lameli [-@lameli_strukturen_2013: 31-33], is the ability to link linguistic data with extra-linguistic information such as demographic data. He acknowledges, however, that administrative units only imperfectly reflect linguistic realities: within a single county, several dialect areas may overlap, and boundaries may not align with speaker perceptions. To demonstrate that generalisations remain possible, he overlayd the county network with Wiesinger's [-@wiesinger1983einteilung] dialect classification (see @fig-lameli-counties). Based on this, Lameli [-@lameli_strukturen_2013: 31-33] argues that every linguistic core and transitional area can be represented within the county framework, concluding that the sheer number of spatial units compensates for any potential distortions.
+
+![Lameli's [-@lameli_strukturen_2013] overlay of the network of German rural districts (*Landkreise*) and urban districts (*kreisfreie Städte*); left: distribution of the districts; right: overlay with Wiesinger's [-@wiesinger1983einteilung] dialect classification map [@lameli_strukturen_2013: 32]](images/Lameli_counties.png){#fig-lameli-counties width="560"}
+
+In a later step, @lameli_strukturen_2013 refined the spatial resolution by integrating simulated location points, multiplying the county network with estimated value distributions, and thereby resolving the administrative structure. This demonstrates that, with sufficient granularity, dialect space can be represented through politically defined regions, provided it is supplemented with careful interpretation and additional modelling.
+
+Another example of an approach aimed at modelling gradual transitions is that employed by Pröll [-@proll2013detecting], who analysed large sets of individual feature maps. Using methods from spatial statistics and stochastic image analysis, as well as fuzzy clustering, Pröll [-@proll2013detecting] was able to visualise the spatial structures of feature clusters with gradual transitions. However, this method still relied on speaker aggregation per location, since the underlying dialect atlas data were based on predefined spatial units rather than individual speakers.
+
+Crucially, although aggregating speakers by location simplifies analysis and yields easily interpretable spatial patterns, it imposes a top-down geographical structure and sacrifices variation at the individual level. This can only be justified if the aggregation is applied carefully, its limitations are acknowledged, and additional measures are taken.
+
+### Dimensionality Reduction Methods {#sec-dimensionality-reduction}
+
+In addition to aggregative methods, dialectometry has made use of dimensionality reduction techniques like Factor Analysis, Principal Component Analysis (PCA), and Multiple Correspondence Analysis (MCA). Dialectometric studies that have used Factor Analysis or PCA include @shackleton2005english, @hyvonen2007multivariate, @proell2015latente, @szmrecsanyi_grammatical_2012, and @vergeiner_quantitative_2023. According to Pickl [-@pickl_fuzzy_2016: 82-83], Factor Analysis and PCA are promising methods for identifying fuzzy dialect areas, which do not have sharply defined boundaries. Although MCA is not commonly applied, it also shows promise in dialectometry. @van2014signal proposed it as a method of "Reverse Dialectometry" [@van2014signal: 6], since it allows linguistic features to be studied first and geographic information to be added to the analysis later. Szmrecsanyi adopted it as "a more radical way to bring features to the fore in (dia)lectometry." [@szmrecsanyi2017featurometry: 345].
+
+Factor Analysis and PCA are multivatiate statistical methods that are applied to a single set of variables. Both methods aim to identify groups of variables that are strongly correlated with each other, yet largely uncorrelated with other groups. These groups of variables are then combined into factors (in Factor Analysis) or components (in PCA), which represent underlying patterns of co-variation in the data. Both methods may be used to summarise relationships among variables, reduce the complexity of a large set of variables to a smaller number of factors or components, provide operational definitions, or test a theory about the nature of the underlying processes. Factor Analysis assumes that factors cause the observed variables, whereas PCA combines variables into components that are only based on shared variance, without assuming any underlying causal structure. For instance, a PCA might yield several components, each of which accounts for a proportion of the total variance in the data [@tabachnick2007using: 607ff.].
+
+In dialectometry, factors or principal components derived from Factor Analysis or PCA can be used to categorise dialects according to their characteristic sets of linguistic features. A feature $\times$ component matrix can be computed to show which linguistic features contribute most to each dialect [@pickl_fuzzy_2016: 82-83]. This contrasts with aggregative approaches, in which the linguistic basis can only be recovered post hoc [@vergeiner_quantitative_2023: 91; @wieling2015advances: 249].
+
+However, although Factor Analysis and PCA are designed to be applied to an individual $\times$ feature matrix [@husson_exploratory_2017: 1-2], dialectometric studies often use a location $\times$ feature frequency matrix instead. Categorical variables are therefore commonly transformed into usage frequencies across all speakers per location, imposing a degree of top-down aggregation. This is necessary because Factor Analysis and PCA require numeric and complete input data [@pickl_fuzzy_2016: 82], whereas linguistic data are frequently categorical, for instance in the case of lexical or morphosyntactic variants. This approach was suggested by Pickl [-@pickl_fuzzy_2016: 82-83] and has been applied by researchers such as @szmrecsanyi_grammatical_2012, and @vergeiner_quantitative_2023, who both aggregated linguistic feature frequencies at the county level.
+
+@szmrecsanyi_grammatical_2012 even refers to his procedure, including the aggregation step prior to PCA, as a "cooking recipe for conducting corpus-based dialectometry" [@szmrecsanyi_grammatical_2012: 24]. In his study of British English dialects, he used a frequency matrix of location $\times$ features (158 $\times$ 57) as input to a PCA. To map the components, he aggregated the data further to the county level. @szmrecsanyi_grammatical_2012 recognises the potential loss of granularity and the risk of aggregation artifacts, addressing these concerns by examining the pairwise correlations between features contributing to the first principal component (e.g. multiple negation and use of *ain't*) across three levels of granularity: counties, locations, and individual interviews. He concludes “That these interdependencies scale across three levels of granularity is good news, for it means that the feature interdependencies uncovered by the PCA are not some aggregation artifact but are real all the way to the level of the individual dialect speakers” [@szmrecsanyi_grammatical_2012: 140].
+
+To ensure data completeness, dimensionality reduction approaches typically use carefully designed, controlled datasets and structured interviews. For instance, @vergeiner_quantitative_2023 collected data from 163 speakers, ensuring at least four participants per location and balancing for gender and age. In addition, the sampling procedure adhered to dialectological sampling criteria established by Chambers and Trudgill [-@chambers1998dialectology: 29-30].
+
+The resulting output in these studies is a location $\times$ component matrix, which indicates how strongly each location is associated with each principal component. These factor or component loadings can be visualised, for example in the form of heatmaps, as shown in @fig-vergeiner-components, which features Vergeiner's [-@vergeiner_quantitative_2023] results on the dialect morphology of Austria.
+
+![Austrian dialect groups mapped based on component loadings derived from PCA [@vergeiner_quantitative_2023: 96]](images/Vergeiner_components.png){#fig-vergeiner-components}
+
+Pröll et al. [-@proell2015latente] used the same method to create heatmaps after conducting Factor Analysis, assigning each location a colour and intensity based on the factor with the highest loading. They argue that it is not the boundary between two areas that is central, but the darker centres of the factors that represent their core areas. Boundaries, they note, arise as a by-product when in a given area one factor becomes stronger than the others [@proell2015latente: 8].
+
+While these approaches using Factor Analysis or PCA aggregate speaker data by location, MCA is specifically designed for categorical datadata. Therefore, it does not require data to be transformed through aggregation. Nevertheless, MCA has been used less frequently in dialectometric research. The concept of principal components is transferred directly from PCA to MCA, in which they are referred to as dimensions. MCA typically applies to an individual $\times$ feature matrix, in which individuals are represented as rows, and their responses to categorical variables are represented as columns. This structure is common in survey data, where each variable corresponds to a question, and each possible response corresponds to a category within that variable [@husson_exploratory_2017: 131–133].
+
+@van2014signal demonstrated how MCA can be applied to dialect data. Using a verb cluster orders $\times$ dialect locations (31 $\times$ 267) matrix, he analysed word order variation in verb clusters across 267 Dutch dialects and mapped them against theoretical hypotheses from the literature. The variation could be reduced to three dimensions, interpreted as three different underlying grammatical parameters. He termed this approach "Reverse Dialectometry", as it reverses the usual dialectometric logic: rather than starting with geographic clustering, it first models the co-occurence of linguistic constructions, assuming that verb cluster orders occurring in the same locations are more similar than those with different geographical distributions. Unlike in classical dialectometry, correlations between linguistic and geographical distance play no role in his approach. Location data are used solely as binary variables in the input matrix to identify which cluster orders occur together and which do not [@van2014signal: 6–7, 14].
+
+@szmrecsanyi2017featurometry evaluated van Craenenbroeck's [-@van2014signal] method from a more explicit dialectological perspective. He demonstrated how MCA can visualise co-occurrence patterns among morphosyntactic features and produce an interpretable plot of variant profiles. Based on 76 features from 46 non-standard varieties of International English from the "Handbook of Varieties of English" [@kortmann2004global] his MCA plot (@fig-world-englishes) shows the 20 features and varieties that contribute most to the first two identified dimensions. A “+” indicates presence, a “-” absence of a feature. Proximity of linguistic features in the plot reflects co-occurrence. The varieties are also projected into the same plot so that each variety appears near the features that characterise it. The upper left quadrant groups features that are characteristic of English-based pidgin and creole languages, such as serial verbs and preverbal negation. The upper right quadrant comprises North American varieties, particularly the use of *ain't*. The lower right quadrant contains British varieties and New Zealand English, characterised by features like unsplit *for to* in infinitival clauses and the absence of *be* deletion. The lower left quadrant predominantly contains indigenised L2 varieties, e.g. Ghanaian English, which are characterised by features like multiple negation and the use of *them* instead of *those*. The MCA result therefore suggests that the first dimension (Dim 1) contrasts pidgins, creoles, and L2 varieties (on the left) with native varieties (on the right), while the second dimension (Dim 2) distinguishes between British English (at the bottom) and North American English (at the top). This MCA result illustrates that dialect-typological studies need to consider both internal and external factors to make generalisations [@Röthlisberger2019: 13-14].
+
+![MCA plot based on the survey of morphosyntactic features from the "Handbook of World Englishes" [@kortmann2004global], as adapted by @Röthlisberger2019 from @szmrecsanyi2017featurometry](images/world_englishes.png){#fig-world-englishes}
+
+In summary, MCA offers a major advantage over aggregative approaches and other dimensionality reduction approaches: it preserves individual variation while making it possible to interpret fuzzy dialect areas in terms of the categorical linguistic features that define them.
+
+# Data and Methods {#sec-data-and-methods}
+
+This chapter presents the methodology of this thesis. I first outline my approach to investigating regional linguistic structures in North Rhine–Westphalia, using MCA. I then describe the PALAVA survey design and dataset, the variables I included in the analysis, and the steps I took to prepare the data. The analysis sample comprises data from `r sample_size` speakers and 13 linguistic variables.
+
+## Method: Multiple Correspondence Analysis {#sec-mca}
+
+Given the limited knowledge of regiolect structures in North Rhine–Westphalia, this thesis adopts an exploratory rather than hypothesis-testing approach. I use MCA to identify latent patterns in linguistic features that co-vary geographically across speakers. Like Factor Analysis and PCA, MCA reduces data complexity by extracting underlying dimensions. Whereas Factor Analysis and PCA require continuous variables, MCA is specifically designed for categorical data [@husson_exploratory_2017: 131–133]. This format matches the PALAVA survey dataset [@palavaApp], which consists of categorical responses from a large sample of speakers across diverse linguistic variables (see @sec-dataset).
+
+From a mathematical perspective, the mechanics of MCA are similar to those of PCA. Each principal component can be understood as an independent vector, or axis, in a geometric space representing the coordinates of individuals on that component. Since each axis corresponds to a single dimension in the geometric space, the identified components are simply referred to as dimensions in MCA. These reduced dimensions summarise patterns of co-variation across the categorical features. They are derived so that the variance in the data is maximised, preserving as much information as possible. The proportion of variance explained by a dimension is called inertia. It indicates how much of the overall structure in the data is represented by that dimension, i.e. the dimension's explanatory power [@husson_exploratory_2017: 144-146].
+
+Unlike Factor Analysis and PCA, which operate on a co-variance or correlation matrix of continuous variables, MCA is performed on an indicator matrix. An indicator matrix has dimensions $I \times K$, where $I$ is the total number of individuals and $K$ is the total number of categories across all variables [@husson_exploratory_2017: 134]. It is a binarised matrix, so each cell takes the value 1 if the individual possesses that category, and 0 otherwise. This binary encoding represents categorical data numerically so that distance-based calculations can be performed. In the context of dialectometry, this may correspond, for example, to a speaker $\times$ linguistic feature matrix, where a variable (e.g. the choice of auxiliary verb) is divided into its categories (e.g. *haben* 'to have' and *sein* 'to be').
+
+MCA calculates distances in two ways: between individuals based on the categories they have in common or differ on and between categories based on how often they are selected by the same individuals. Both individuals and categories are placed as points in a multidimensional space, resulting in a cloud of individuals and a cloud of categories. Points that are close together in these clouds represent strong associations. Both types of distances - between individuals and between categories - will be explained in the following, although the focus in MCA lies on the categories, as they simultaneously represent the variables and the individuals associated with them [@husson_exploratory_2017: 133-138].
+
+The distance between two individuals is mathematically expressed as:
+
+$$
+d^2_{i,i'} = C \sum_{k=1}^{K} \frac{(x_{ik} - x_{i'k})^2}{I_k}
+$$
+
+This formula calculates the squared distance to determine which categories the individuals share or differ on: for each category $k$, we examine whether individual $i$ and individual $i'$ possess that category (with values 1 or 0), and compute the squared difference of their values $(x_{ik} - x_{i'k})^2$. The squared difference equals 0 if both either have or do not have the category, and 1 if they differ. Since not all categories are equally informative, these differences are weighted by the frequency of the respective category, i.e. by dividing by ${I_k}$ (the total number of individuals possessing category $k$). This way, uncommon but distinctive features contribute more to distinguishing individuals [@husson_exploratory_2017: 134].
+
+As a result:
+
+\(1\) If two individuals select exactly the same categories, their distance is zero.\
+(2) If they share many categories, they are positioned close together.\
+(3) If they differ only on a rare category, they are placed further apart to reflect that distinction.\
+(4) If they share a rare category, they are drawn closer together even if they differ elsewhere, because they share a particularly distinctive feature [@husson_exploratory_2017: 133].
+
+Similarly, the distance between two categories is defined as:
+
+$$
+d^2_{k,k'} = C'  \frac{I_{k \neq k'}}{I_k I_{k'}},
+$$
+
+where $C'$ is a constant. This formula demonstrates that MCA computes distances between categories by determining how often they are selected together across individuals. The more individuals who have either category $k$ or $k'$, but not both (i.e. $I_{k \neq k'}$), the larger the distance between them. This is adjusted by the sample sizes of each category (${I_k}$ and ${I_{k'}}$), which again means that differences involving rare categories stand out more. Therefore, if two categories are frequently chosen by the same people, they will appear near each other in the plot. Conversely, categories that appear in different sets of individuals are farther apart. The resulting distances are formalised using $\chi^2$ distances for comparing column profiles [@husson_exploratory_2017: 134-137].
+
+The inertia of a category $k$ is defined by its distance from the barycentre, which is the centre of gravity of all categories. The barycentre's coordinates are $1/I$, representing the average position of individuals, where each individual contributes a value of 1 for the categories they select. If a category is chosen by only a few individuals, its coordinates lie farther from the barycentre, so it has higher inertia. Conversely, categories selected by many individuals lie closer to the centre and show lower inertia [@husson_exploratory_2017: 140-142].
+
+Because rare categories contribute more to distinguishing individuals, care is needed when defining categories and interpreting results. For instance, a category selected by 1% of participants has approximately twice the inertia of one chosen by 50%. This can be problematic and distort the analysis if rarity results from missing data, e.g. due to participants skipping questions. In such cases, very rare categories should be removed in order to focus on the features of interest. To avoid over-interpreting random points or rare categories, the contribution value of each individual or category can be examined. The contribution value indicates how well each speaker or feature is represented in the plot by showing how strongly it defines a given dimension, with all contributions adding up to 100% [@husson_exploratory_2017: 140-146].
+
+Another consideration when interpreting MCA results is that the proportion of inertia explained by the first dimensions is generally relatively low, commonly around 10–20% per dimension. This is because the method studies multi-way relationships across categorical variables, which spreads the variance over numerous dimensions. By contrast, in PCA, which focuses on linear relationships, variance can be high in the first components if the original variables are highly correlated. For this reason, it is important in MCA to look beyond the first two dimensions in order to understand the full structure of the data [@husson_exploratory_2017: 144-145].
+
+I apply MCA directly to speaker-level data without geographic aggregation, preserving individual linguistic variation. To this end, I use a speaker $\times$ feature matrix as input, where each row represents an individual speaker and each column represents their responses to categorical variables. I then map speakers' coordinates on the resulting dimensions onto their geographic coordinates to examine spatial distributions. I follow @van2014signal and @szmrecsanyi2017featurometry in this approach, but my analysis differs in that I only use speaker response data for MCA. Location-based information is entirely absent prior to the analysis itself. I only incorporate it afterwards to plot individuals on a geographical map. Geography therefore functions solely as a visualisation layer and does not influence the clustering of linguistic features. Moreover, I do not plot aggregate data by location; instead, I use the exact longitude and latitude corresponding to the place where each individual was most linguistically influenced during their lifetime.
+
+This speaker-level approach also allows for a more informed, empirical assessment of which locations are actually suitable for spatial aggregation, should one choose to apply aggregative methods as a next step for investigating regional linguistic variation in North Rhine-Westphalia. Rather than assuming that administrative units represent coherent linguistic areas, this approach allows for a data-driven evaluation of local linguistic consistency. For example, the city of Essen is located in a transition zone between different dialect areas, as the *Einheitsplurallinie* (see @sec-dialects) passes through it. In addition, Essen is a large urban centre in the Ruhr area, where people are exposed to more linguistic varieties than in rural regions. As a result, speakers from Essen may not exhibit uniform behaviour, but may instead show considerable variation in their coordinates on the identified dimensions. Aggregating these speakers by calculating frequencies for the entire city or municipality would smooth out this variation entirely. By retaining speaker-level data, in contrast, it is possible to examine whether speakers from the same location cluster together on the same dimension: consistent clustering among individuals would provide evidence in support of treating that location as a coherent spatial unit in subsequent analyses. Conversely, if individuals from a given location systematically differ in their coordinates, this would challenge the validity of treating that location as a unit.
+
+In addition to the linguistic variables used in the calculation of the MCA dimensions, supplementary categories can be projected onto the MCA plot. These supplementary categories are illustrative and do not influence the computation of dimensions [@husson_exploratory_2017: 20-24, 130-140, 146-147]. In my analysis, I chose to use demographic vaiables as supplementary variables to interpret the resulting linguistic dimensions sociogeographically afterwards. For instance, projecting age as a supplementary variable can reveal whether younger speakers align with innovative or Standard German features, while older speakers might cluster with more conservative variants. This way, demographic information can help disentangle regional patterns from apparent time-related changes.
+
+## Dataset Description {#sec-dataset}
+
+The analysis in this thesis is based on data collected via the PALAVA app [@palavaApp]. PALAVA is a project jointly developed by the Kommission für Mundart- und Namensforschung Westfalens (Commission for Dialect and Name Research in Westphalia) and the LVR-Institut für Landeskunde und Regionalgeschichte (LVR Institute of Area Studies and Regional History). The app was launched on 9 June 2023 and is specifically designed to collect data on the use of colloquial regional language in North Rhine-Westphalia. The central aim of the project is to address a data gap: prior to the launch of the PALAVA app, there had been no comprehensive and reliable dataset with broad spatial coverage on linguistic varieties in North Rhine-Westphalia, which limited research on their geographic distribution [@seiferheld_palava_2023: 91].
+
+The PALAVA app is modeled after well-established linguistic crowdsourcing apps developed for Luxembourgish [@entringer2021schnessen] and Swiss German [@hasse_gschmois_2021]. App-based data collection offers several advantages but it also presents challenges. The main advantage is the possibility to collect spoken data from a large number of participants in a relatively time- and cost-efficient manner [@seiferheld_palava_2023: 92]. Risks are, for example, inaccurate or irrelevant responses, misunderstandings of task instructions, or diminished audio quality due to background noise [@leemann2016crowdsourcing: 17-20; @seiferheld_palava_2023: 92]. Moreover, it is not possible to control that participants consistently produce the linguistic variety one wishes to study; in this case, regiolects [@rein_palava_2024: 108]. Nevertheless, studies comparing app-based data with results from traditional survey methods have demonstrated a high degree of consistency, supporting the validity and reliability of crowdsourced app data in linguistic research [@hilton_editorial_2021: 3; @hasse_gschmois_2021: 13-14]. Furthermore, according to Reips [-@reips_standards_2002: 250], the rate of repeated participation in most internet-based studies is below 3%, which alleviates concerns about data duplication.
+
+@fig-palava-screenshots shows screenshots from the PALAVA app, including the start screen, the indication of the participant's linguistic place of origin, the task overview, and an example of a picture naming task (*Wie nennst du das auf dem Bild?* ‘What do you call this in the picture?'). Before completing the tasks in the PALAVA app, users are asked to provide basic metadata, including their age, gender, whether their first language is a language other than German, and their highest level of education [@rein_palava_2024: 100; @seiferheld_palava_2023: 94]. They are also asked to indicate the geographical location that has influenced them most by selecting a point on an interactive map, providing precise geodata. This selection is guided by the question *Für welchen Ort gelten deine Angaben? (Das ist der Ort, der dich sprachlich am meisten geprägt hat. In den meisten Fällen ist das der Ort, an dem du aufgewachsen bist.)* 'Which place do your answers refer to? (This is the place that has shaped your language the most. In most cases, it is where you grew up.)').
+
+![Screenshots of the PALAVA app: start screen, indication of place of origin, task overview, and picture naming task (*Wie nennst du das auf dem Bild?* ‘What do you call this in the picture?') [@lwl_palava]](images/PALAVA_screenshot.png){#fig-palava-screenshots width="580"}
+
+More than 15,000 users have registered in the app. The demographic distribution in the sample is not entirely homogeneous. The largest age group comprises individuals born in the 1960s. Younger participants, particularly those born after 2000, are underrepresented. The gender distribution is as follows: 56.1% female, 43.4% male, and 0.5% identifying as non-binary (*divers*). Most participants have completed further education, with the majority holding a university degree. Geographically, participants are distributed across the entire state of North Rhine-Westphalia, with the number of participants per location varying considerably, from one individual in Vettweiß (near Aachen) to 580 in Düsseldorf. On average, there are 22 participants per location [@rein_palava_2024: 100-103].
+
+The main survey currently comprises 242 items. This includes 152 items from the initial round in 2023 and an additional 90 questions introduced in a second round in October 2024 [@rein_palava_2024: 99]. The linguistic features measured cover the linguistic levels of phonetics/phonology, morphology, syntax, and pragmatics [@seiferheld_palava_2023: 94] and were selected based on their relevance for the area under investigation according to prior research.[^1]
+
+[^1]: This information is based on my own experience working at the LVR and was confirmed in conversation with the project team leader, Dr. Charlotte Rein. In @sec-linguistic-criteria, I detail the relevance of each variable included in my analysis based on prior research.
+
+Most of the questions are open-ended (e.g. picture naming, sentence completion tasks), to which participants respond via voice message [@rein_palava_2024: 99]. For example, the open-ended question in @fig-palava-screenshots targets the use of lexical variants of the word *Bonbons* 'sweets', as well as the *-chen*/-*ken* diminutive suffix alternation (as in the regional variant *Bömsken* 'sweets'), which corresponds to the contrast between \ipa{[ç]} and \ipa{[k]} marked by the *Benrather Linie*.
+
+The aim in prioritising responses in the form of voice messages is to simulate realistic linguistic settings and thereby produce authentic language data, as well as to enable the analysis of phonetic and phonological features. The voice message questions vary in their degree of openness. Some suggest a syntactic structure in the answers, such as sentence completion or naming tasks. Others simulate communicative situations, encouraging spontaneous speech by allowing participants to respond more freely. The survey also includes single-choice, multiple-choice, and text completion tasks. Tasks are grouped into blocks of nine, each of which ends with a "crown task" that can be unlocked. These "crown tasks" focus on idiomatic expressions and are part of a gamification strategy intended to boost user engagement and encourage continued participation [@rein_palava_2024: 99-100].
+
+The PALAVA data were transcribed and annotated by LVR and LWL employees, as well as students from the University of Münster. All of the annotators were either trained linguists or linguistics students. Nevertheless, the annotations show some inconsistencies, as multiple annotators were involved and there were no standardised annotation guidelines. In some cases, the same task was annotated by more than one person. Because of a lack of detailed documentation and the absence of double-annotations, it is not possible to calculate inter-annotator-agreement. However, care was taken by LVR and LWL project staff to ensure that phonological variables were annotated consistently by the same person. This was done to avoid inconsistencies caused by subjective perception of phonological features. Morphosyntactic phenomena, in contrast, were often annotated by several different annotators.[^2]
+
+[^2]: The information in this paragraph is also based on my own experience working at the LVR, where I was involved in the transcription and annotation process.
+
+At the time of writing this thesis, the PALAVA dataset is the most comprehensive source of data on regional linguistic variation in North Rhine-Westphalia. Although its crowdsourcing format poses certain challenges, it captures more spontaneous and conversational language than is elicited in standard interviews and provides precise geospatial data.
+
+## Variable Selection {#sec-variable-selection}
+
+This section details the variables I selected from the PALAVA dataset and the preprocessing steps I applied to the data. I chose the variables for MCA based on their relevance to the study area, as established by previous variational linguistics research. I also considered practical aspects, such as data completeness and distributions within the dataset. Unless otherwise specified, all examples provided in this section are from the PALAVA dataset.
+
+### Linguistic Features {#sec-linguistic-criteria}
+
+The analysis includes seven phonological variables, two morphological variables, and four syntactic variables. They capture a range of linguistic phenomena that are known to be relevant to regional linguistic variation in North Rhine–Westphalia.
+
+**Phonological Variables**
+
+@tbl-phon-variables lists the phonological variables with examples. The first three variables relate to vowel length, measured for \ipa{/a/} in the first syllable[^3] of *Fahrrad* 'bicycle' and for \ipa{/o/} in *Oma* and *Opa* in the binomial *Oma und Opa* 'grandma and grandpa'. According to the NOSA [@elmentaler2015norddeutscher: 141-142], the vowels \ipa{/a/}, \ipa{/e/}, \ipa{/i/}, \ipa{/o/}, and \ipa{/u/} are pronounced long in Standard German, but may be pronounced short in some regiolects in monosyllabic words, certain bisyllabic words (e.g. *Fahrrad*, *Oma*, *Opa*), and in the stressed suffixes *-it* and -*ik* (as in *Musik* 'music)'. Shortening of \ipa{/o/} is accompanied by a change in vowel quality from \ipa{[oː]} to \ipa{[ɔ]}. Non-standard vowel shortening is a feature inherited from Low German (i.e. north of the *Benrather Linie*, see @sec-dialects) and reflects the retention of historical short vowels. The NOSA reports its prevalence in North Rhine-Westphalia in Westphalia, in the Ruhr area, and the northern and southern Lower Rhine regions, with the highest frequencies in South and East Westphalia.[^4]
+
+[^3]: In variationist research, the second syllable of *Fahrrad* (-rad) is the canonical example of regional variation in vowel length [cf. @elmentaler2015norddeutscher: 141, 150]. Due to incomplete annotation of this syllable in the present dataset, I included the first syllable *Fahr-* instead. A pairwise, per-speaker comparison of vowel length in the two syllables is provided in @tbl-pairwise-comparisons in Appendix A, showing the proportion of pronunciation differences across speakers.
+
+[^4]: Note that the NOSA only covers regiolects spoken north of the *Benrather Linie*.
+
+Another characteristic feature of the Low German area is the spirantisation of word-final \ipa{/g/} following a front vowel, as in *Berg* 'mountain' and *weg* 'away'. In Standard German, \ipa{/g/} in this phonological context is realised as a voiceless velar plosive \ipa{[k]}, whereas regiolects in the Low German area, as well as parts of the Central German area, may show spirantisation to a voiceless palatal fricative \ipa{[ç]}. In some regions, the spirant may further undergo coronalisation to \ipa{[ɕ]} or \ipa{[ʃ]} [@elmentaler2015norddeutscher: 251-252].
+
+The spirantised variant is considered a conservative feature, which occurs most frequently where dialectal influence remains strong [@elmentaler2015norddeutscher: 251-252]. NOSA data [@elmentaler2015norddeutscher: 262] indicate the highest frequencies of spirantisation of word-final \ipa{/g/} following a front vowel to \ipa{[ç]} in South Westphalia, the Westmünsterland, parts of the northern Münsterland, and East Westphalia. Coronalisation, by contrast, is characteristic of the West Central German (*Westmitteldeutsch*) dialect area and extends northwards into North Rhine-Westphalia as far as the southern Lower Rhine region [@elmentaler2015norddeutscher: 342; @herrgen_koronalisierung_2016: 74-76]. It is not inherited from older dialects but is a relatively recent sound shift that started as late as in the second half of the 19th century [@herrgen_koronalisierung_2016: 97].
+
+Although coronalisation could potentially serve as a contrastive feature for distinguishing the spatial distribution of regiolects in North Rhine-Westphalia, I grouped all spirantised variants into a single category (\ipa{ç/ʃ}/) in the present analysis, as coronalisation was rare in the *Berg* data (distribution: \ipa{[ç]} 33%, \ipa{[k]} 65%, \ipa{[ʃ]} 2%). For *weg*, no coronalisation occurred in the sample. To nevertheless account for coronalisation as a feature characteristic of southern North Rhine-Westphalia, I included the alternation between \ipa{[ç]} and \ipa{[ʃ]} (including \ipa{[ɕ]}) in the coda of *Milch* 'milk' as a variable.
+
+The last phonological variable concerns the affricate \ipa{/p͡f/} in syllable onset, as in *Pfütze* 'puddle'. This affricate emerged during the Second Sound Shift (see @sec-dialects) and is a characteristic feature of Standard German. In much of Northern Germany, however, \ipa{[p͡f]} is replaced by the fricative \ipa{[f]}. This substitution can be explained by the influence of Low German: in Low German, the affricate \ipa{[p͡f]} does not exist in the phoneme inventory; its Low German equivalent is \ipa{[p]}. When acquiring Standard German as an L2, L1 Low German speakers replaced \ipa{[p͡f]} with the acoustically similar fricative \ipa{[f]}, which already existed in their phoneme inventories and allowed them to maintain a phonemic contrast with Low German \ipa{[p͡f]}. The NOSA attests the substitution of \ipa{[p͡f]} by \ipa{[f]} in North Rhine-Westphalia in their entire area under investigation (corresponding to the Low German area), sometimes even with a prevalence of 100% [@elmentaler2015norddeutscher: 291-292].
+
+::: {#tbl-phon-variables}
+| **Linguistic feature**                                         | **Variable**               | **Description**                                                                                                              | **Examples**                             |
+|------------------|------------------|-------------------|------------------|
+| vowel length                                                   | fahr (long/short)          | short vs. long \ipa{/a/} in the syllable *Fahr-* in *Fahrrad* 'bicycle'                                                      | \ipa{[ˈfaːʁaːt]}; \ipa{[ˈfaʁat]}         |
+|                                                                | oma (long/short)           | short vs. long \ipa{/o/} in the syllable *O-* in *Oma* 'grandma'                                                             | \ipa{[ˈʔoːma]}; \ipa{[ˈʔɔma]}            |
+|                                                                | opa (long/short)           | short vs. long \ipa{/o/} in the syllable *O-* in *Opa* 'grandma'                                                             | \ipa{[ˈʔoːpʰa]}; \ipa{[ˈʔɔpʰa]}          |
+| spirantisation of word-final \ipa{/g/} following a front vowel | berg (\ipa{k}/\ipa{ç/ʃ})   | realisation of \ipa{/g/} in *Berg* 'mountain' as \ipa{[k]}, \ipa{[ç]} or \ipa{[ʃ]} (spirantisation)                          | \ipa{[beɐ̯k]}; \ipa{[bɛɐ̯ç]}; \ipa{[bɛʁʃ]} |
+|                                                                | weg (\ipa{k}/\ipa{ç})      | realisation of \ipa{/g/} in *weg* 'away' (as in *Wisch doch mal die Krümel weg.*) as \ipa{[k]} or \ipa{[ç]} (spirantisation) | \ipa{[vɛk]}; \ipa{[vɛç]}                 |
+| coronalisation of \ipa{/ç/}                                    | milch (\ipa{ç}/\ipa{ʃ})    | realisation of word-final \ipa{/ç/} in *Milch* 'milk' as \ipa{[ç]} or \ipa{[ʃ]} (coronalisation)                             | \ipa{[mɪlç]}; \ipa{[mɪlʃ]}               |
+| \ipa{/p͡f/} in syllable onset                                   | pfuetze (\ipa{pf}/\ipa{f}) | realisation of \ipa{/p͡f/} in *Pfütze* 'puddle' as \ipa{[p͡f]} or \ipa{[f]}                                                    | \ipa{[ˈp͡fʏt͡sə]}; \ipa{[ˈfʏt͡sə]}          |
+
+Phonological Variables with Examples
+:::
+
+**Morphological Variables**
+
+As illustrated in @tbl-morpho-variables, I included two morphological variables reflecting the alternation between the diminutive suffixes *-chen* and *-ken*. This alternation appears, for example, in lexical variants of *Schnapsglas* 'shot glass', e.g. realised as *Pinnchen/Pinn(e)ken* or *Schnapsgläschen*/*Schnapsgläsken*, and in lexical variants of *bisschen* 'a little' , e.g. *bisschen/bissken* or *Stückchen*/*Stücksken*. This suffix alternation is one of the features where the *Benrather Linie* may still play a role for differentiating regiolects, linked to the \ipa{[ç]}/\ipa{[k]} contrast in Low German and Central German dialects observed in the *machen/maken* distinction (see @sec-dialects). As outlined by @jordan_diminutive_2003, there are several subtypes of the -*ken* suffix variant in the *Westfälisch* dialect group. These subtypes vary across regions, for example in whether diminutives are used at all, whether the stem vowel changes, whether \ipa{[k]} undergoes palatalisation, whether the suffix appears in its full or shortened form, and how the plural is formed. For the present thesis, however, I restrict the analysis to the *-chen*/*-ken* contrast, for three reasons: (1) the availability of annotations, (2) the distribution of the available data, and (3) the exploratory nature of this initial analysis.
+
+::: {#tbl-morpho-variables}
+| **Linguistic feature** | **Variable**    | **Description**                                                      | **Examples**                                                |
+|------------------|------------------|-------------------|------------------|
+| diminutive suffix      | biss (chen/ken) | *-chen* vs. *-ken* in lexical variants of *Schnapsglas* 'shot glass' | *Pinnchen*; *Pinneken*; *Schnapsgläschen*; *Schnapsgläsken* |
+|                        | pinn (chen/ken) | *-chen* vs. *-ken* in lexical variants of *bisschen* 'a little'      | *bisschen*; *bissken*; *Stückchen*; *Stücksken*             |
+
+Morphological Variables with Examples
+:::
+
+**Syntactic Variables**
+
+The variables for the morphosyntactic domain are listed in @tbl-syntactic-variables. The use of *sein* 'to be' instead of *haben* 'to have' as the auxiliary in the present perfect is a regional feature in northwestern Germany, including Westphalia [@AdA2003] (round 4, question 1c). For example, in the following sentences, examples 1.a and 2.a use a form of *haben*, while example 1.b and 2.b use a form of *sein*, with no change in meaning:
+
+> (1) 
+>
+>     (a) *Ich habe mit Krafttraining angefangen.*\
+>         'I (have) started strength training.'
+>
+>     (b) *Ich bin mit Krafttraining angefangen.*\
+>         'I (have) started strength training.'
+
+> (2) 
+>
+>     (a) *Ich habe angefangen zu schreiben.*\
+>         'I (have) started writing.'
+>
+>     (b) *Ich bin angefangen zu schreiben.*\
+>         'I (have) started writing.'
+
+According to the Atlas zur deutschen Alltagssprache (AdA) [@AdA2003], the use of *sein* in constructions like *Das Spiel ist um 9 Uhr angefangen* 'The game started at 9 o'clock' is specific to northwestern areas of Germany and only occasionally used, whereas *haben* (*Das Spiel hat um 9 Uhr angefangen*) is common in German overall (see @fig-ada-haben-sein). @fig-haben-sein-map illustrates the regional distribution of *Ich bin mit Krafttraining angefangen.* vs. *Ich habe mit Krafttraining angefangen.* based on the PALAVA data. The map shows a concentration of *sein* as the auxiliary for *anfangen* in the northern part of North Rhine-Westphalia, specifically East Westphalia, the Münsterland, and the Lower Rhine Region. *haben* is distributed throughout the entire federal state. This distribution confirms the AdA's [@AdA2003] findings shown in @fig-ada-haben-sein.
+
+![Distribution of *ist* vs. *hat angefangen* in Germany according to the Atlas zur deutschen Alltagssprache (AdA) [@AdA2003]. Each data point represents a survey location.](images/AdA_auxiliar_alternation.jpg){#fig-ada-haben-sein fig-align="center" width="600"}
+
+::: {#fig-haben-sein-map}
+```{r auxiliary-map, echo=FALSE}
+
+annotation_training_angef <- annotation_training_angef |> 
+  left_join(id_area, by = "survey_result_id") |> 
+  filter(training_angef %in% c("haben", "sein")) |> 
+  mutate(training_angef = recode(training_angef,
+                                 "haben" = "habe",
+                                 "sein"  = "bin"))
+
+annotation_training_angef <- annotation_training_angef |>
+  filter(!is.na(geometry_str) & geometry_str != "") |>
+  #convert geodata to geometry object:
+  mutate(geometry = st_as_sfc(geometry_str, crs = 4326)) |>
+  st_as_sf()
+
+ggplot() +
+  geom_sf(data = nrw, fill = "white", color = "grey60") +
+  geom_sf(
+    data = annotation_training_angef,
+    aes(color = training_angef),
+    size = 2, 
+    alpha= 0.8,
+    stroke = 0.3) +
+  scale_color_manual(
+    name = "auxiliary",
+    values = c("habe" = "#00BFC4",
+               "bin"  = "#D55E00")) +
+  coord_sf(
+    xlim = c(280100, 531853),
+    ylim = c(5560000, 5830000),
+    expand = FALSE
+  ) +
+  labs(
+    title = "bin/habe angefangen",
+    subtitle = "\"Ich ... mit Krafttraining angefangen.\""
+  ) +
+  theme_void() +
+  theme(
+    legend.position = "right",
+    legend.title = element_text(size = 12, face = "bold"),
+    legend.text = element_text(size = 10)
+  )
+```
+
+Distribution of *bin* vs. *habe* *angefangen* in North Rhine-Westphalia based on responses from the entire PALAVA survey dataset (n=569). Each data point represents an individual speaker. Vector shapes sourced from @opengdeDataNRW.
+:::
+
+Standard grammar references, e.g. the Duden [@duden2021: 86], also describe *haben* as the standard auxiliary for *anfangen*, with *sein* considered a regional variant. Based on corpus and experimental data, Weber [-@weber_regionale_2020: 294] even considers this phenomenon part of the regional spoken and written norm in Westphalia. The use of *sein* is associated with the telicity and intransitivity of *anfangen*, similarly to the use of *zijn* 'to be' in Dutch, e.g. *Het spel is begonnen* 'The game has started' [@AdA2003]. This construction therefore likely spread from Dutch into Low German dialects near the Dutch border and remains stable in parts of northwestern Germany [@AdA2003].
+
+The next syntactic variable concerns the presence or absence of the *am* progressive construction, which is formed with the preposition *am* + infinitive. For instance, 3.a is in the simple present tense, whereas 3.b uses the *am* progressive to emphasise an ongoing action:
+
+> (3) 
+>
+>     (a) *Die Vögel baden.*\
+>         'The birds are bathing.'
+>
+>     (b) *Die Vögel sind am Baden.*\
+>         'The birds are bathing.'
+
+This form is well-documented in North Rhine-Westphalia and is recognised as a grammaticalised feature of Standard German, particularly in oral registers [@duden2022: 397]. Previous studies [@elspass2005sprachgeschichte; @kallenborn2019regionalsprachliche] and AdA data [@AdA2003] (round 2, question 18a–b; round 10, question 10a–d) confirm its presence throughout the entire state. According to @kallenborn2019regionalsprachliche [118-121, 145], the *am* progressive is still undergoing grammaticalisation, with morphosyntactic and semantic constraints gradually weakening: in *Moselfränkisch* (southwestern North Rhine-Westphalia), it is already highly grammaticalised and no longer restricted to particular action verbs. In *Ripuarisch*, it has very few restrictions and can, for example, occur with both incorporated and non-incorporated object NPs. Due to data sparsity, the construction analysed in this thesis is a basic intransitive construction with an action verb (*baden* 'to bathe'). In such contexts, the *am* progressive should occur across all of North Rhine-Westphalia.
+
+Finally, I included the splitting of pronominal adverbs, such as *darauf* 'on it' or *dafür* 'for it'. The unsplit form in examples 4.a and 5.a corresponds to the Standard German variant [@fleischer2016pronominaladverbien]. In German dialects and colloquial speech, however, it is also possible to split pronominal adverbs [@fleischer2016pronominaladverbien]. This is shown in examples 4.b and 5.b, with the preposition (*drauf*/zu) moved to the end of the clause:
+
+> (4) 
+>
+>     (a) *Darauf habe ich keine Lust.*\
+>         'I don't feel like it. / I don't have any desire for that.'
+>
+>     (b) *Da habe ich keine Lust drauf.*\
+>         'I don't feel like it. / I don't have any desire for that.'
+
+> (5) 
+>
+>     (a) *Dazu habe ich keinen Bock.\
+>         *'I don't feel like it. / I don't have any desire for that.'
+>
+>     (b) *Da habe ich keinen Bock zu.\
+>         *'I don't feel like it. / I don't have any desire for that.'
+
+The split construction is more frequent in northern and, to some extent, central western areas of Germany [@fleischer2016pronominaladverbien]. This is supported by data from the AdA [@AdA2003] (round 1, questions 11–12; round 2, questions 21a–c), @kallenborn2019regionalsprachliche, and the SyHD-atlas [@fleischer2016pronominaladverbien].
+
+::: {#tbl-syntactic-variables}
+| **Linguistic feature**                  | **Variable**                 | **Description**                                                                                                                                                  | **Examples**                                                                        |
+|------------------|------------------|-------------------|------------------|
+| past perfect auxiliary verb             | schreiben_angef (haben/sein) | auxiliary alternation in perfect tense constructions: *haben* 'to have' vs. *sein* 'to be' (context: *angefangen zu schreiben* ‘started to write’)               | *Ich habe/bin angefangen zu schreiben.*                                             |
+|                                         | training_angef (haben/sein)  | auxiliary alternation in perfect tense constructions: *haben* 'to have' vs. *sein* 'to be' (context: *mit Krafttraining angefangen* ‘started strength training’) | *Ich habe/bin mit Krafttraining angefangen.*                                        |
+| aspect                                  | voegel_baden (simple/prog)   | presence or absence of progressive aspect (*am* + infinitive)                                                                                                    | *Die Vögel baden.* (simple); *Die Vögel sind am Baden.* (progressive)               |
+| pronominal adverbs (split construction) | keine_lust (non-split/split) | presence or absence of splitting of pronominal adverbs (context: lexical variants of *keine Lust haben* ‘to not have any desire’)                                | *Darauf habe ich keine Lust.* (non-split); *Da habe ich keinen Bock drauf.* (split) |
+
+Syntactic Variables with Examples
+:::
+
+### Supplementary Variables {#sec-supplementary-variables}
+
+```{r demographic-count, include=FALSE}
+
+age_count <- table(donNA_with_id$age_group) |> 
+  as.data.frame()
+
+gender_count <- table(donNA_with_id$gender) |> 
+  as.data.frame() |> 
+  mutate(Var1 = factor(Var1,
+                       levels = c("female",
+                                  "male",
+                                  "both",
+                                  "non-binary")))
+
+percent_gender <- prop.table(table(donNA_with_id$gender)) * 100
+
+education_count <- table(donNA_with_id$education_level) |> 
+  as.data.frame() |> 
+  mutate(Var1 = factor(Var1,
+                       levels = c("inSchool",
+                                  "LowSec",
+                                  "MidSec",
+                                  "VocTrain",
+                                  "Abitur",
+                                  "UniDeg")),
+         Var1 = fct_recode(Var1,
+                           "In School" = "inSchool",
+                           "Lower Secondary" = "LowSec",
+                           "Middle Secondary" = "MidSec",
+                           "Abitur" = "Abitur",
+                           "Vocational Training" = "VocTrain",
+                           "University Degree" = "UniDeg"))
+
+```
+
+I included the sociodemographic metadata for the `r sample_size` participants as supplementary variables in the MCA. These variables are age, gender, and level of education. Their distribution in the final sample is presented below.
+
+@fig-age illustrates the distribution of participants across age groups. The majority of participants (n=`r age_count$Freq[age_count$Var1 == "1962-1971"]`) were born between 1962 and 1971, while the oldest (1932–1941) and youngest (2002–2011) age groups are the least represented, with `r age_count$Freq[age_count$Var1 == "1932-1941"]` and `r age_count$Freq[age_count$Var1 == "2002-2011"]` participants, respectively.
+
+::: {#fig-age}
+```{r age-plot, echo=FALSE}
+
+ggplot(age_count, 
+       aes(x = Var1, y = Freq)) +
+  geom_bar(stat = "identity", position = "dodge", fill = "steelblue") +
+  scale_y_continuous(expand = c(0,0)) +
+  labs(x = "Age Group", y = "Number of Participants") +
+  theme_classic()
+```
+
+Distribution of participants across age groups in the final sample (N=`r sample_size`).
+:::
+
+The gender distribution in the sample is shown in @fig-gender. The majority of participants are female (n=`r gender_count$Freq[gender_count$Var1 == "female"]`), followed by male participants (n=`r gender_count$Freq[gender_count$Var1 == "male"]`). A small number of participants identified as non-binary (n=`r gender_count$Freq[gender_count$Var1 == "non-binary"]`) or reported both female and male genders (n=`r gender_count$Freq[gender_count$Var1 == "both"]`). The proportion of female participants (`r round(percent_gender[gender_count$Var1 == "female"], 1)`%) in the analysis sample is higher than in the overall survey, which comprised 56.1% female, 43.4% male, and 0.5% non-binary participants, as described in @sec-dataset. Because inclusion in the analysis sample depended primarily on high response rates (see @sec-preprocessing), this discrepancy reflects a higher survey completion rate among female participants than among male participants. This confirms Rein and Schürmann's [-@rein_palava_2024] findings that in the PALAVA dataset, gender is the primary factor influencing the number of responses per participant.
+
+::: {#fig-gender}
+```{r gender-plot, echo=FALSE}
+
+ggplot(gender_count, 
+       aes(x = Var1, y = Freq)) +
+  geom_bar(stat = "identity", position = "dodge", fill = "#D55E00") +
+  scale_y_continuous(expand = c(0,0)) +
+  labs(x = "Gender", y = "Number of Participants") +
+  theme_classic() +
+  theme(
+    axis.text.x = element_text(size = 14),
+    axis.text.y = element_text(size = 14),
+    axis.title.x = element_text(size = 16),
+    axis.title.y = element_text(size = 16)
+  )
+```
+
+Distribution of participants by gender in the final sample (N=`r sample_size`).
+:::
+
+The distribution of participants across levels of education is shown in @fig-education. Most participants hold a university degree (n=`r education_count$Freq[education_count$Var1 == "University Degree"]`), followed by those who have completed vocational training (n=`r education_count$Freq[education_count$Var1 == "Vocational Training"]`) and those with Abitur (n=`r education_count$Freq[education_count$Var1 == "Abitur"]`), indicating that the participants are overall highly educated. Only one participant is currently in school (n=`r education_count$Freq[education_count$Var1 == "In School"]`), which corresponds to the low representation of the youngest age group (born 2002–2011).
+
+::: {#fig-education}
+```{r education-plot, echo=FALSE}
+
+ggplot(education_count, 
+       aes(x = Var1, y = Freq)) +
+  geom_bar(stat = "identity", position = "dodge", fill = "#009E73") +
+  scale_y_continuous(expand = c(0,0)) +
+  labs(x = "Highest Level of Education", y = "Number of Participants") +
+  theme_classic()
+```
+
+Distribution of participants by highest completed level of education in the final sample (N=`r sample_size`).
+:::
+
+{{< pagebreak >}}
+
+### Variable Filtering and Preprocessing {#sec-preprocessing}
+
+I extracted the annotations and associated metadata via SQL from two separate PALAVA databases. In the raw data, each annotated information was stored as a separate row, so each participant and each app question were represented by multiple rows. Across all participants and tasks, this resulted in `r format(nrow(metaData) + nrow(annotation), big.mark = ",")` rows of data, requiring complex data wrangling. Preparing the data involved extensive regrouping and recoding to resolve inconsistencies in the annotations, regrouping categories from open-ended questions, and handling large amounts of missing data. The `R` code used for data preparation and the analysis can be found in Appendix C.
+
+As MCA requires complete data, I filtered the data according to data completeness. The crowdsourcing format of the PALAVA app inevitably resulted in a considerable amount of missing data from participants not completing the survey or skipping individual questions. Of 25 questions that I had originally pre-selected according to linguistic criteria, 10,674 participants responded to only one question, while only a single participant answered all. Based on this distribution (@fig-participants-per-task), I set a threshold of at least 20 answered questions per participant, retaining 617 participants.
+
+::: {#fig-participants-per-task}
+```{r plot-participants-per-task, echo = FALSE}
+
+ggplot(participants_per_num_tasks, aes(x = factor(num_tasks_answered), y = n)) +
+  geom_col(fill = "#0072B2") +
+  geom_text(aes(label = n), vjust = -0.3, size = 3) +
+  geom_vline(
+    xintercept = which(levels(factor(participants_per_num_tasks$num_tasks_answered)) == "20") - 0.5,
+    linetype = "dashed", color = "#D55E00"
+  ) +
+  scale_y_continuous(
+    expand = expansion(mult = c(0, 0.03))
+  ) +
+  labs(
+    x = "Number of Answered Questions",
+    y = "Number of Participants"
+  ) +
+  theme_minimal()
+
+```
+
+Distribution of participants by number of answered questions (N= `r nrow(metaData)`). Cutoff threshold: ≥ 20 questions answered.
+:::
+
+```{r, include=FALSE}
+
+freq_answers_per_variable_20more_pre <- annotation_filtered_20more_pre |> 
+  group_by(task_id) |> 
+  summarise(num_participants = n_distinct(survey_result_id))
+
+```
+
+Next, I assessed the coverage of each question within the filtered participant sample. Most questions were well-represented, with 21 out of 25 questions having responses from 558 or more participants (see @fig-variable-count). Four questions, however, showed very low response rates (9, 15, 16, and 21 participants, respectively) because they were part of round two of the PALAVA app. I excluded these questions from further analysis.[^5] In some cases, two variables were covered with one question, e.g. vowel length in *Oma* and vowel length in *Opa* were measured with one single question.
+
+[^5]: The excluded questions targeted vowel length in *Kaffee* 'coffee', /g/ after a velar vocal (in *Zug* 'train'), and progressive constructions (two questions).
+
+::: {#fig-variable-count}
+```{r, echo=FALSE}
+
+#Number of Participants per Task (Threshold at 20)
+  ggplot(freq_answers_per_variable_20more_pre, aes(x = num_participants, y = reorder(factor(task_id), num_participants), fill = num_participants >= 22)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = num_participants), hjust = -0.3, size = 3) +
+  scale_fill_manual(values = c("TRUE" = "#0072B2", "FALSE" = "#D55E00")) +
+  scale_x_continuous(expand = c(0,0)) +
+  coord_cartesian(xlim = c(0, max(freq_answers_per_variable_20more_pre$num_participants) * 1.1)) +
+  labs(
+    x = "Number of Participants per Question",
+    y = "Question ID"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+Number of participants per question. Blue bars indicate questions included in the analysis, while orange bars indicate questions excluded due to low response counts.
+:::
+
+I then reviewed the remaining variables by their categories. To ensure consistency and to avoid mixing types of linguistic behaviour (e.g. speech production and acceptance ratings), I included only open-ended questions. Open-ended questions may better reflect natural speech than choice-tasks, but they also produce many rare categories with small sample sizes. These rare categories are problematic for MCA because they increase the dimensionality of the data, leading to individuals being represented in larger spaces, while contributing little additional information [@husson_exploratory_2017: 152–154]. Therefore, I grouped rare responses into broader categories, following Husson [-@husson_exploratory_2017: 152–154]. For instance, in the variable `berg`, I grouped all variants representing spirantisation or coronalisation as \ipa{"ç/ʃ"}, and in `milch`, I recoded the alveolo-palatal fricative \ipa{[ɕ]} to the postalveolar \ipa{ʃ} category (see @sec-linguistic-criteria). One participant was excluded entirely because their response (\ipa{[mɪlk]}) could not be grouped into either the \ipa{"ç"} or \ipa{"ʃ"} categories (and did not reflect a known regional feature). All resulting variables are binary. While MCA does not require explicit binarisation, it is recommended by Husson [-@husson_exploratory_2017: 141-142].
+
+The open-ended questions also led to considerable lexical variation. For example, in the question targeting vowel length in *Fahrrad* 'bicycle', some participants used alternative lexemes, such as the regional variant *Fiets*. These responses could not be consistently compared, as vowel length depends on phonological context and lexical properties. Including all responses would have distorted the analysis, whereas excluding these participants entirely would have discarded useful data for other variables. Therefore, I decided to set these values to `NA` and handle them as missing data to be imputed later. I applied this approach only to phonological variables, where lexical comparability was essential.
+
+For syntactic variables, such as the progressive construction, I assumed lexical variation to not compromise comparability to the same degree, so I applied no lexical filtering. For the morphological variables concerning the form of the diminutive suffix, responses featured *-chen* and *-ken* forms across different lexemes (e.g. *Pinnchen*, *Pinnches*, *Schnapsgläschen*, *Pinneken*, *Gläskes*; all meaning 'shot glas'). Because the phonological variation in the diminutive morpheme itself corresponded to the contrast involved in the Second Sound Shift, I defined two categories based on the phonological forms -*chen* (\ipa{[çən]}) and -*ken* (\ipa{[kən]}). However, I set all responses that were not diminutives (e.g. *Schnapspinn*) to `NA`.
+
+I imputed missing data using the iterative MCA algorithm `imputeMCA()` from the `R` package "missMDA". This algorithm first generates a complete disjunctive table (CDT), which is a binarised table where each category of every variable is treated as a separate column. `imputeMCA()` then iteratively estimates missing responses based on the relationships among all participants and categories. In the initial phase, missing entries are assigned a provisional value (e.g. the mean of each category). An MCA is performed on this completed table, and the resulting coordinates of individuals and variables are used to update the missing entries. This iterative process depends on the number of dimensions specified in the MCA and continues until the algorithm converges. The result is a fully imputed disjunctive table, which can be used to conduct the final MCA [@husson_exploratory_2017: 159].
+
+To avoid overfitting, I excluded variables with ≥30% missing data from further analysis. This threshold is supported by simulations from @josse2012handling, which show that iterative MCA performs well with up to 10% missing data, but performance degrades beyond that. With 30% missing data, the fitting error remained low (0.024), but the prediction error increased nearly fivefold (0.119), indicating overfitting [@josse2012handling: 9-10]. Although Husson [-@husson_exploratory_2017: 158–159] suggests introducing a new category for missing values as an easy way to handle missing categorical data, I did not adopt this approach. While it can reveal the structure of missing data, it may also obscure information contained in the actual responses. For example, in a dataset with only 9% missing data, the first dimensions in the MCA can be almost entirely determined by the missing-data structure [@husson_exploratory_2017: 159]. Given the extent of missing data in the PALAVA dataset, I instead used the iterative MCA algorithm to avoid obscuring regional variation in the data. An overview of the missing value structure for the variables ultimately included in the analysis is provided in @fig-missing-values in Appendix B.
+
+MCA does not assume linear dependence, as it is based on co-occurrence patterns of categories rather than correlations of continuous variables. Nevertheless, I aimed for a balanced feature representation to improve interpretability. For instance, among five past perfect auxiliary items, I retained only two to prevent this feature from forming a separate dimension that would not reflect general regional linguistic variation. Pairwise comparisons of the proportion of differing responses for the included variables are provided in @tbl-pairwise-comparisons in Appendix A.
+
+Finally, I excluded participants whose reported location was outside North Rhine-Westphalia. The final sample comprises `r sample_size` participants.
+
+# Results {#sec-results}
+
+```{r, include=FALSE}
+
+#main summary
+summary(res.mca)
+
+```
+
+```{r, include=FALSE}
+
+#eigenvalues
+round(res.mca$eig, 4)
+
+dimdesc(res.mca)
+
+eig <- get_eigenvalue(res.mca)
+
+```
+
+The MCA identified 13 dimensions, with the first two jointly accounting for 33.49% of the total inertia (see @fig-scree-plot for the scree plot and @tbl-eigenvalues in the Appendix for the inertia explained by all 13 dimensions).
+
+@fig-mca-plot shows the projection of linguistic categories along Dimensions 1 and 2, limited to the categories contributing more than 5% to either dimension. Dimension 1 (21.88% of inertia) primarily consists of phonological features, separating short vowels on the left from long vowels and spirantised word-final /g/ on the right. Dimension 2 (11.61%) is strongly driven by the use of *sein* as a past perfect auxiliary on the top and contrasts it with coronalisation of \ipa{/ç/} in *Milch* at the bottom. The diminutive suffix -*ken*, as in forms of *Pinnchen*/*Pinnken,* contributes moderately to Dimension 2 and slightly to Dimension 1. @tbl-dim1 and @tbl-dim2 summarise these highest-contributing categories.
+
+```{r top-vars, include=FALSE}
+
+var <- get_mca_var(res.mca)
+
+#combine contributions for Dim 1 and Dim 2:
+contrib_sum <- var$contrib[,1] + var$contrib[,2]
+
+top_n <- 12 #top n categories
+top_vars <- names(sort(contrib_sum, decreasing = TRUE))[1:top_n]
+
+```
+
+```{r dim1, include=FALSE}
+
+dim1_vars <- data.frame(Contrib = var$contrib[,1], Coord = var$coord[,1])
+
+dim1_vars <- dim1_vars |> 
+  arrange(desc(Contrib)) |> 
+  head(8) #top X contributing
+```
+
+::: {#tbl-dim1}
+| Category        | Linguistic Feature                                             |                    Contribution |                      Coordinate |
+|------------------|-------------------|-----------------:|-----------------:|
+| oma_long        | vowel length                                                   | `r round(dim1_vars[[1]][1], 2)` | `r round(dim1_vars[[2]][1], 2)` |
+| oma_long        | vowel length                                                   | `r round(dim1_vars[[1]][2], 2)` | `r round(dim1_vars[[2]][2], 2)` |
+| oma_short       | vowel length                                                   | `r round(dim1_vars[[1]][3], 2)` | `r round(dim1_vars[[2]][3], 2)` |
+| opa_short       | vowel length                                                   | `r round(dim1_vars[[1]][4], 2)` | `r round(dim1_vars[[2]][4], 2)` |
+| berg\_\ipa{ç/ʃ} | spirantisation of word-final \ipa{/g/} following a front vowel | `r round(dim1_vars[[1]][5], 2)` | `r round(dim1_vars[[2]][5], 2)` |
+| fahr_short      | vowel length                                                   | `r round(dim1_vars[[1]][6], 2)` | `r round(dim1_vars[[2]][6], 2)` |
+| weg\_\ipa{ç}    | spirantisation of word-final \ipa{/g/} following a front vowel | `r round(dim1_vars[[1]][7], 2)` | `r round(dim1_vars[[2]][7], 2)` |
+| fahr_long       | vowel length                                                   | `r round(dim1_vars[[1]][8], 2)` | `r round(dim1_vars[[2]][8], 2)` |
+
+Categories with Highest Contributions to Dimension 1
+:::
+
+```{r dim2, echo=FALSE}
+
+dim2_vars <- data.frame(Contrib = var$contrib[,2], Coord = var$coord[,2])
+
+dim2_vars <- dim2_vars |> 
+  arrange(desc(Contrib)) |> 
+  head(4) #top 4 contributing
+
+```
+
+::: {#tbl-dim2}
+| Category             | Linguistic Feature          |                    Contribution |                      Coordinate |
+|:-----------------|:-----------------|-----------------:|-----------------:|
+| schreiben_angef_sein | past perfect auxiliary verb | `r round(dim2_vars[[1]][1], 2)` | `r round(dim2_vars[[2]][1], 2)` |
+| training_angef_sein  | past perfect auxiliary verb | `r round(dim2_vars[[1]][2], 2)` | `r round(dim2_vars[[2]][2], 2)` |
+| pinn_ken             | diminutive suffix           | `r round(dim2_vars[[1]][3], 2)` | `r round(dim2_vars[[2]][3], 2)` |
+| milch\_\ipa{ʃ}       | coronalisation of \ipa{/ç/} | `r round(dim2_vars[[1]][4], 2)` | `r round(dim2_vars[[2]][4], 2)` |
+
+Categories with Highest Contributions to Dimension 2
+:::
+
+<div>
+
+```{r mca-plot, include=FALSE}
+
+mca_plot <- fviz_mca_biplot(res.mca,
+                label = "var",
+                invisible = c("ind", "quali.sup"),
+                repel = TRUE,
+                labelsize = 4,
+                pointsize = 2,
+                select.var = list(name = top_vars),
+                ggtheme = theme_minimal(),
+                title = "")
+
+#export as .png because IPA symbols are not rendered correctly:
+ggsave(
+  filename = "images/mca_biplot.png",
+  plot = mca_plot,
+  width = 8,
+  height = 6,
+  dpi = 300,
+  bg = "white")
+```
+
+</div>
+
+![Two-dimensional projection of the cloud of categories (Dimensions 1 and 2)](images/mca_biplot.png){#fig-mca-plot fig-align="center"}
+
+Geographical mapping of individual speaker scores reveals regional patterns. @fig-dim1-map shows positive scores (red) on Dimension 1 concentrated in the Ruhr area, extending north-east into South and East Westphalia, while negative scores (blue) are distributed across the whole state. Municipalities of large cities in these areas (e.g. Essen, Bochum, Duisburg, Bielefeld) show mixed scorings on Dimension 1. The Münsterland and the southern part of North Rhine-Westphalia are more homogenous and exhibit mostly negative scores on Dimension 1.
+
+```{r geodata, include=FALSE}
+
+#conversions of exact geodata to sf format:
+mca_for_map_ind <- st_as_sf(mca_for_map_ind, sf_column_name = "geometry")
+st_crs(mca_for_map_ind) <- 4326
+mca_for_map_ind <- st_transform(mca_for_map_ind, st_crs(nrw))
+
+```
+
+::: {#fig-dim1-map}
+```{r dim1-map, echo=FALSE}
+
+ggplot() +
+  geom_sf(data = nrw, aes(geometry = geometry), fill = "grey95", color = "grey80", size = 0.2) +
+  geom_sf(data = mca_for_map_ind,
+          aes(geometry = geometry, color = .data[["Dim 1"]]),
+          alpha = 0.8, size = 2, stroke = 0.3) +
+  scale_color_gradient2(
+    low = "#08519c", 
+    mid = "white", 
+    high = "#B2182B",
+    midpoint = 0,
+    name = "Dim 1 score"
+  ) +
+  coord_sf(
+    xlim = c(280100, 531853),
+    ylim = c(5560000, 5830000),
+    expand = FALSE
+  ) +
+  theme_void()
+```
+
+Geographical distribution of speaker scores on Dimension 1. Each data point represents an individual. Positive scores appear in red, negative scores in blue. Vector shapes sourced from @opengdeDataNRW.
+:::
+
+Dimension 2 (@fig-dim2-map) has few very high positive scores in the northern part of North Rhine-Westphalia, specifically in rural regions of the Münsterland, East Westphalia, and the Lower Rhine region. The rest of the state, including the Ruhr area and regions south of it, shows neutral to slightly negative scores.
+
+::: {#fig-dim2-map}
+```{r dim2-map, echo=FALSE}
+
+ggplot() +
+  geom_sf(data = nrw, aes(geometry = geometry), fill = "grey95", color = "grey80", size = 0.2) +
+  geom_sf(data = mca_for_map_ind,
+          aes(geometry = geometry, color = .data[["Dim 2"]]),
+          alpha = 0.8, size = 2, stroke = 0.3) +
+  scale_color_gradient2(
+    low = "#08519c", 
+    mid = "white", 
+    high = "#B2182B",
+    midpoint = 0,
+    name = "Dim 2 score"
+  ) +
+  coord_sf(
+    xlim = c(280100, 531853),
+    ylim = c(5560000, 5830000),
+    expand = FALSE
+  ) +
+  theme_void()
+```
+
+Geographical distribution of speaker scores on Dimension 2. Each data point represents an individual. Positive scores appear in red, negative scores in blue. Vector shapes sourced from @opengdeDataNRW.
+:::
+
+{{< pagebreak >}}
+
+The supplementary variables age group, gender, and highest level of education show very weak associations with Dimension 1 and Dimension 2. Most groups cluster around the barycentre, indicating minimal association (also see Appendix A, @tbl-quali-supp, where association strength is quantified by very low $\eta^2$ values).
+
+In @fig-mca-age-plot, age groups are colour-coded from light grey (youngest) to dark orange (oldest). Older age groups are slightly positive on Dimension 2, whereas younger groups are slightly negative. The youngest (2002–2011) and the oldest cohort (1932–1941) have more extreme coordinates on Dimension 1 and Dimension 2, but both are rare in the sample (see @sec-supplementary-variables) and should be interpreted with caution.
+
+```{r quali-supp, echo=FALSE}
+
+var_df <- as.data.frame(res.mca$var$coord)
+sup_df <- as.data.frame(res.mca$quali.sup$coord)
+
+var_df$category <- rownames(var_df)
+var_df$type <- "Active"
+sup_df$category <- rownames(sup_df)
+sup_df$type <- "Supplementary"
+
+#filter active and supplementary variables to be displayed on plots:
+var_df <- var_df[var_df$category %in% top_vars, ]
+sup_age <- sup_df |> 
+  filter(category %in% c("2002-2011", "1992-2001", "1982-1991", "1972-1981", "1962-1971", "1952-1961", "1942-1951", "1932-1941"))
+sup_gender <- sup_df |> 
+  filter(category %in% c("male", "female"))
+sup_education <- sup_df |> 
+  filter(category %in% c("Abitur", "LowSec", "MidSec", "UniDeg", "VocTrain"))
+
+plot_age <- rbind(var_df, sup_age)
+plot_gender <- rbind(var_df, sup_gender)
+plot_education <- rbind(var_df, sup_education)
+
+```
+
+```{r sup-age, include=FALSE}
+
+#####these plots are created with ggplot (to have more options for customising them), but there is also a function in factoextra for this#####
+
+# Define a color gradient for age groups (light → dark)
+age_colors <- colorRampPalette(c("#e66101", "grey"))(length(sup_age$category))
+
+mca_age_plot <- ggplot(plot_age, aes(x = `Dim 1`, y = `Dim 2`, 
+                     color = ifelse(type == "Active", "Active", category), 
+                     label = category)) +
+  geom_point(size = 2) +
+  geom_text_repel(max.overlaps = 30) +
+  scale_color_manual(
+    values = c("Active" = "#1f78b4", setNames(age_colors, unique(sup_age$category))),
+    guide = "none"
+  ) +
+  theme_minimal(base_size = 14) +
+  labs(x = "Dim1 (21.9%)",
+       y = "Dim2 (11.6%)") +
+  geom_hline(yintercept = 0, color = "grey50", linetype = "dashed") +
+  geom_vline(xintercept = 0, color = "grey50", linetype = "dashed") +
+  coord_cartesian(expand = TRUE)
+
+#export as .png because IPA symbols are not rendered correctly:
+ggsave(
+  filename = "images/mca_age_plot.png",
+  plot = mca_age_plot,
+  width = 8,
+  height = 6,
+  dpi = 300,
+  bg = "white")
+```
+
+![Projection of linguistic categories and supplementary variable age on the MCA dimensions (Dim 1 and Dim 2)](images/mca_age_plot.png){#fig-mca-age-plot}
+
+{{< pagebreak >}}
+
+The associations with gender (@fig-mca-gender-plot) are also minimal: women are slightly negative, especially on Dimension 1, and men slightly positive. Non-binary participants and participants reporting both genders are excluded from the visualisation due to low counts.
+
+```{r sup-gender, include=FALSE}
+
+mca_gender_plot <- ggplot(plot_gender, aes(x = `Dim 1`, y = `Dim 2`, color = type, label = category)) +
+  geom_point(size = 2) +
+  geom_text_repel(max.overlaps = 30) +
+  scale_color_manual(values = c("Active" = "#1f78b4", "Supplementary" = "#e66101"),
+                     guide = "none") +
+  theme_minimal(base_size = 14) +
+  labs(x = "Dim1 (21.9%)",
+       y = "Dim2 (11.6%)") +
+  geom_hline(yintercept = 0, color = "grey50", linetype = "dashed") +
+  geom_vline(xintercept = 0, color = "grey50", linetype = "dashed") +
+  coord_cartesian(expand = TRUE)
+
+#export as .png because IPA symbols are not rendered correctly:
+ggsave(
+  filename = "images/mca_gender_plot.png",
+  plot = mca_gender_plot,
+  width = 8,
+  height = 6,
+  dpi = 300,
+  bg = "white")
+```
+
+![Projection of linguistic categories and supplementary variable gender on the MCA dimensions (Dim 1 and Dim 2)](images/mca_gender_plot.png){#fig-mca-gender-plot}
+
+Regarding education level (@fig-mca-education-plot), participants with low/mid-secondary school degree or vocational training score slightly positive on Dimension 1, whereas Abitur and university degree holders score slightly negative. Participants holding a university degree additionally have slightly negative coordinates on Dimension 2. The single participant still in school was excluded.
+
+```{r sup-education, include=FALSE}
+
+mca_education_plot <- ggplot(plot_education, aes(x = `Dim 1`, y = `Dim 2`, color = type, label = category)) +
+  geom_point(size = 2) +
+  geom_text_repel(max.overlaps = 30) +
+  scale_color_manual(values = c("Active" = "#1f78b4", "Supplementary" = "#e66101"),
+                     guide = "none") +
+  theme_minimal(base_size = 14) +
+  labs(x = "Dim1 (21.9%)",
+       y = "Dim2 (11.6%)") +
+  geom_hline(yintercept = 0, color = "grey50", linetype = "dashed") +
+  geom_vline(xintercept = 0, color = "grey50", linetype = "dashed") +
+  coord_cartesian(expand = TRUE)
+
+#export as .png because IPA symbols are not rendered correctly:
+ggsave(
+  filename = "images/mca_education_plot.png",
+  plot = mca_education_plot,
+  width = 8,
+  height = 6,
+  dpi = 300,
+  bg = "white")
+
+```
+
+![Projection of linguistic categories and supplementary variable education level on the MCA dimensions (Dim 1 and Dim 2)](images/mca_education_plot.png){#fig-mca-education-plot}
+
+{{< pagebreak >}}
+
+# Discussion {#sec-discussion}
+
+Previous research demonstrates that regiolects are not sharply bounded varieties but part of overlapping continua. Traditional dialectometric methods, however, obscure these gradual transitions by aggregating data into predefined spatial units. This thesis adopted a different approach: using MCA on speaker-level data from North Rhine–Westphalia, it identified latent linguistic structures without imposing artificial boundaries. Rather than testing pre-existing hypotheses, the analysis explored patterns of co-variation across categorical features and mapped their geographical distribution.
+
+The MCA revealed two primary dimensions, accounting for 21.88% and 11.61% of inertia, respectively. Distinct regional patterns emerged, though more diffuse than those usually depicted on dialect maps. This is not surprising, given the focus on regiolects, which are closer to Standard German and extend over larger spatial areas than local dialects, as well as the relatively small size of North Rhine–Westphalia. In addition, the maps illustrate gradual transitions by using colour gradients rather than discrete areas, in contrast to conventional dialect maps.
+
+Positive scores on Dimension 1 are concentrated in the Ruhr area and South and East Westphalia, whereas negative scores are distributed across the entire state. Dimension 2 shows high positive scores in northern rural areas, especially the Münsterland, East Westphalia, and the Lower Rhine. Associations with the demographic variables age, gender, and education are minimal, suggesting that the patterns primarily reflect regional variation.
+
+Dimension 1 reflects a continuum ranging from Standard German features at one end, distributed throughout the state, to regional features at the other end. Long vowels, characteristic of Standard German, appear on the negative side. In contrast, vowel shortening, spirantisation of word-final /g/, and the diminutive suffix -*ken* are on the positive side. All three features are inherited from Low German, which lies north of the *Benrather Linie* (see @sec-linguistic-criteria). This is consistent with the geographical distribution of positive scores. However, it aligns only roughly with the *Benrather Linie* itself and more closely with a separation from the *Westdeutsch* area south of it, as identified by @lameli_strukturen_2013, and from the *Münsterländisch* dialect region in the northwest (see @sec-dialects). Including a wider range of linguistic variables in future analyses would help clarify the northern regiolect's spatial distribution.
+
+Therefore, Dimension 1 likely corresponds to the vertical spectrum and distinguishes a Ruhr area and Westphalian regiolect not from other regiolects, but from Standard German. This might reflect the dense speaker concentration in the Ruhr area and South Westphalia (see @fig-dim1-map) and a high proportion of Standard German responses. Ideally, an MCA on a more evenly distributed dataset would confirm this interpretation.
+
+This interpretation is closely tied to a central methodological challenge: the uncontrolled register of responses in the crowdsourced data. Without filtering for Standard German or regiolect responses, the resulting MCA dimensions inevitably mix both. Separating these registers and defining precise criteria is difficult, as regiolects are based on Standard German and include its features to varying degrees depending on different factors, including the region. It is not even clear whether they constitute two distinct systems. On the other hand, the MCA may have already distinguished between Standard German and regiolects in a data-driven way, even without explicit a priori criteria, and made it possible to visualise the continuum. Nevertheless, this is an initial interpretation and should be tested further. One possible solution would be to use edit distance to quantify how far each speaker is from Standard German.
+
+The minor associations with demographic variables align with a distinction between Standard German and (northern) regiolect in Dimension 1. Young speakers, women, and participants with higher levels of education tended to score slightly negatively, while others scored slightly positively. This is consistent with previous findings that young women use fewer non-standard forms in standard registers than men (e.g. @kotthoff2024genderlinguistik: 243–271; @rein2020zuruck: 299–305). However, as the contributions of the demographic categories are very small and some groups are underrepresented, these associations should be interpreted with caution. Future data collection could provide a more balanced representation and clarify the relationship between demographic variables and regional linguistic variation. To this end, a project has already been launched to introduce the PALAVA app to the youngest generation in schools (@ilr_school).
+
+Turning to Dimension 2, a smaller, more concentrated structure is revealed in the north of North Rhine–Westphalia. Dimension 2 thus adds precision beyond Dimension 1 by isolating features strongly localised in this part of the state. High positive scores are confined to a few speakers, particularly in Westphalia (including the Münsterland) and, to a lesser extent, the Lower Rhine. Dimension 2 is primarily shaped by the use of *sein* as an auxiliary in the past perfect tense, therefore aligning with the distribution *Ich bin/habe mit Krafttraining angefangen.* shown in @fig-haben-sein-map. In addition, it captures the diminutive suffix -*ken*, a feature also associated with regions north of the *Benrather Linie* (see @sec-linguistic-criteria). This and the negative contribution of coronalisation of \ipa{/ç/}, which is a feature typical of *Westdeutsch* (see @sec-linguistic-criteria), indicates that Dimension 2 may distinguish northern from southern varieties, capturing a north-south gradient. The concentration of higher scores in rural compared to urban areas is particularly interesting and suggests that an urban–rural distinction is worth exploring as a supplementary variable in future analyses. The observed age gradient might support this: older participants, who are more likely to live in rural areas and use regional or even dialectal forms, scored higher on Dimension 2 than younger participants.
+
+Non-standard varieties in the southern part of North Rhine–Westphalia are not captured by the first two dimensions. These varieties are likely represented in subsequent dimensions. The inertia, category coordinates, and category contributions for the first five dimensions are provided in @tbl-category-coordinates and @tbl-category-contributions in Appendix B. Features that have been associated with southern regions, for example coronalisation or non-split pronominal adverbs, show higher values in these later dimensions. While MCA requires careful interpretation of subsequent dimensions (see @sec-mca), these lie beyond the scope of the present thesis and are therefore not discussed further.
+
+One of the aims of using MCA was to assess the linguistic homogeneity or heterogeneity of municipalities, and therefore whether they could be aggregated in subsequent analyses or not. Dimension 1 shows considerable variation in municipalities in the Ruhr area and East Westphalia (Essen, Bochum, Duisburg, and Bielefeld). However, if negative scores on Dimension 1 reflect Standard German features, this result may not provide any information about local overlaps of regional features. In contrast, Dimension 2 scores are relatively homogeneous across locations. Consequently, based on the first two dimensions alone, no definitive conclusions can be drawn about municipal homogeneity. A more comprehensive evaluation could involve examining overlaps between additional subsequent dimensions after they have been interpreted.
+
+A general limitation of the analysis in this thesis is that it does not quantify the contribution of the geodata to the identified MCA dimensions. Although regional patterns are visualised, these spatial structures are not statistically verified. Nevertheless, the precise geographic coordinates available for each speaker enable an analysis of spatial effects without aggregating the data. Future analyses could apply spatial statistical tests, for example Moran's I [@grieve2013multivariate] or the Mantel test [@scherrer2012recovering], to evaluate whether the distributions of dimension scores reflect genuine spatial clustering.
+
+Finally, the analysis demonstrates the potential of crowdsourced app data for dialectometry. Despite its limitations, the MCA yielded coherent results: for example, questions in the app targeting the same linguistic features clustered together in their categories, suggesting generally consistent behaviour across participants. Compared with traditional dialectological interviews, app-based approaches thus provide an efficient alternative for collecting linguistic data on a large scale.
+
+The results show that MCA can reveal coherent patterns in regional linguistic variation, even under challenging data conditions: Standard German and regiolect responses were not separated, the set of linguistic variables was limited, the demographic distribution was not balanced, the geographical distribution of speakers was uneven, and spatial associations were not statistically tested. Future work should add more linguistic variables, balance the demographic representation, and apply spatial statistics. Overall, this thesis demonstrates that MCA can identify regiolect structures without aggregating individual responses.
+
+# Conclusion {#sec-conclusion}
+
+In this thesis, I applied a multivariate, bottom-up statistical approach to large-scale regiolect data from North Rhine–Westphalia, a linguistically diverse state with little prior research on its regiolects. Regiolects are shaped by historical dialects, their proximity to the national standard, and social conventions, which makes their analysis complex. By applying MCA, latent dimensions of regional linguistic variation were identified, and their geographical distribution was explored without aggregating data or imposing predefined boundaries.
+
+During the analysis, several challenges of applying MCA to crowdsourced app data became apparent. These included inconsistent annotations of responses to open-ended questions, large amounts of missing data, uneven spatial coverage, and uncontrolled registers. After careful preprocessing, filtering, and handling of missing values, the MCA revealed coherent and interpretable dimensions.
+
+The first two dimensions revealed a vertical continuum ranging from Standard German to a northern regiolect located in the Ruhr area and South and East Westphalia, as well as a rural northern variety specific to the Lower Rhine, the Münsterland, and East Westphalia. Their geographical distributions support the view that regiolects form continua with gradual vertical and horizontal transitions, rather than distinct, bounded entities. However, the formation of dimensions was limited by the uneven geographical distribution of speakers. While MCA has proven useful for identifying latent patterns, future work should incorporate methods for verifying spatial effects, such as spatial statistics. Future analyses could also refine these findings by systematically distinguishing between Standard German and regiolect responses to confirm the interpretation and by incorporating additional linguistic variables. Data from younger speakers, which are currently being collected through the PALAVA school project, will also provide a more balanced representation of demographic effects.
+
+This thesis presents the first data-driven, multivariate analysis of regiolect variation in North Rhine–Westphalia. It contributes both to the empirical description of regional linguistic variation in Germany and to the methodological development of dialectometry, as applied to regiolects. Most importantly, this work highlights the importance of approaches that preserve individual linguistic variation and shows how dimensionality reduction methods can improve our understanding of regional linguistic continua.
+
+{{< pagebreak >}}
+
+# References
+
+## Literature
+
+::: {#refs}
+:::
+
+## Packages Used
+
+```{r package-versions, echo=FALSE}
+
+sessionInfo()
+
+```
+
+## Package References
+
+```{r generateBibliography, results="asis", echo=FALSE}
+
+packages.bib <- sapply(1:length(loadedNamespaces()), function(i) toBibtex(citation(loadedNamespaces()[i])))
+
+knitr::write_bib(c(.packages(), "knitr"), "packages.bib")
+
+require("knitcitations")
+cleanbib()
+options("citation_format" = "pandoc")
+read.bibtex(file = "packages.bib")
+
+```
+
+{{< pagebreak >}}
+
+# Appendix A: Additional Tables {.unnumbered}
+
+::: {#tbl-pairwise-comparisons}
+```{r diff-percentages, echo=FALSE}
+
+diff_percentages <- diff_percentages |> 
+  rename(
+    `Variables Compared` = variables_compared,
+    `Proportion` = proportion_different
+  )
+
+kable(diff_percentages, escape = FALSE,
+      caption = "Pairwise Comparisons Between Variables: Percentage of Differing Responses")
+
+```
+:::
+
+::: {#tbl-eigenvalues}
+```{r eig-inertia-tbl, echo=FALSE}
+
+eigen_table <- data.frame(
+  Dimension = 1:length(res.mca$eig[,1]),
+  Eigenvalue = round(res.mca$eig[,1], 2),
+  Percentage_of_Inertia = round(res.mca$eig[,2], 2),
+  Cumulative_Inertia = round(res.mca$eig[,3], 2)
+)
+
+kable(eigen_table, caption = "MCA Eigenvalues (Absolute Variance Explained) and Inertia (Percentage of Total Variance Explained)")
+
+```
+:::
+
+{{< pagebreak >}}
+
+::: {#tbl-quali-supp}
+```{r eta-sup, echo=FALSE}
+
+#coordinates of supplementary variables:
+supp_coords <- res.mca$quali.sup$coord
+coords_dim1 <- supp_coords[, "Dim 1"]
+coords_dim2 <- supp_coords[, "Dim 2"]
+
+#eta2 values for Dim 1 and Dim; how much of the variance of a given dimension is explained by that supplementary variables (not contribution):
+supp_eta2 <- res.mca$quali.sup$eta2
+eta2_dim1 <- supp_eta2[, "Dim 1"]
+eta2_dim2 <- supp_eta2[, "Dim 2"]
+
+supp_table <- data.frame(
+  Coord_Dim1 = coords_dim1,
+  Coord_Dim2 = coords_dim2,
+  Eta2_Dim1 = eta2_dim1,
+  Eta2_Dim2 = eta2_dim2
+)
+
+supp_table <- supp_table |>  
+  mutate(across(everything(), ~round(., 2)))
+
+kable(supp_table, caption = "Supplementary variables: Coordinates and Contributions to Dimension 1 and Dimension 2")
+
+```
+:::
+
+{{< pagebreak >}}
+
+::: {#tbl-category-coordinates}
+```{r category-coordinates, echo=FALSE}
+category_coords   <- as.data.frame(res.mca$var$coord) |> 
+  mutate(across(everything(), ~round(., 2)))
+
+kable(category_coords, caption = "MCA Category Coordinates")
+
+```
+:::
+
+{{< pagebreak >}}
+
+::: {#tbl-category-contributions}
+```{r category-contributions, echo=FALSE}
+
+category_contrib  <- as.data.frame(res.mca$var$contrib) |> 
+  mutate(across(everything(), ~round(., 2)))
+
+kable(category_contrib, caption = "MCA Category Contributions")
+
+```
+:::
+
+{{< pagebreak >}}
+
+# Appendix B: Additional Figures {.unnumbered}
+
+::: {#fig-missing-values}
+```{r examine-nas, echo=FALSE}
+
+#miss_var_summary(donNA_features) \# % missing per variable
+
+#variable n_miss pct_miss
+
+#<chr> <int> <num>
+
+#1 vowellength_rad 277 45.9
+
+donNA_miss <- donNA |> select(fahr, oma, opa, berg, milch, weg, pfuetze, biss, pinn, schreiben_angef, training_angef, voegel_baden, keine_lust)
+
+vis_miss(donNA_miss) + theme(axis.text.x = element_text(angle = 75, hjust = 0))
+```
+
+Overview of missing values by variable
+:::
+
+::: {#fig-scree-plot}
+```{r scree-plot, echo=FALSE}
+
+fviz_screeplot(res.mca, addlabels = TRUE, ylim = c(0, 25),
+               ncp = 13)
+
+```
+
+MCA scree plot: inertia explained by dimension
+:::
+
+{{< pagebreak >}}
+
+# Appendix C: Code {.unnumbered}
+
+The complete code used for the analyses in this thesis is contained within the Quarto (`.qmd`) file, which is accessible via the following Git repository: [ginareinhard/regiolectsNRW](https://github.com/ginareinhard/regiolectsNRW)
